@@ -532,6 +532,121 @@ describe.each(providers)('%s quota-driven routing with actual provider adapters'
     expect(f.state.cooldowns[`${provider}:a`]).toBeUndefined()
   })
 
+  async function onPaidKey(f: ReturnType<typeof fixture>): Promise<void> {
+    await f.controller.initialize(provider)
+    expect(await f.controller.onRetry((await f.reject('a')).input)).toBe(true)
+    expect(await f.controller.onRetry((await f.reject('b', { attempt: 2 })).input)).toBe(true)
+    expect(f.accounts.find(account => account.active)?.id).toBe('key')
+  }
+
+  it('returns from the paid key to a subscription at the next prompt once one is usable again', async () => {
+    const f = fixture(provider)
+    await onPaidKey(f)
+    await f.controller.reclaim(provider)
+    expect(f.activate.mock.calls.map(call => call[1])).toEqual(['b', 'key'])
+    f.advance(3_600_001)
+    await f.controller.reclaim(provider)
+    expect(f.activate.mock.calls.map(call => call[1])).toEqual(['b', 'key', 'a'])
+    expect(f.state.sticky[provider]).toBe('a')
+    expect(f.persist.mock.calls.at(-1)?.[0].sticky[provider]).toBe('a')
+  })
+
+  it('prefers the favorite subscription when leaving the paid key', async () => {
+    const f = fixture(provider, { settings: { favoriteAccountID: 'b' } })
+    await onPaidKey(f)
+    f.advance(3_600_001)
+    await f.controller.reclaim(provider)
+    expect(f.activate.mock.calls.at(-1)?.[1]).toBe('b')
+  })
+
+  it.each(['reported exhausted', 'signed out', 'expired token'] as const)('stays on the paid key while every subscription is %s', async kind => {
+    const f = fixture(provider)
+    await onPaidKey(f)
+    f.advance(3_600_001)
+    if (kind === 'reported exhausted') f.setMonitor(() => new Response(JSON.stringify(monitorBody(provider, f.now(), 100))))
+    for (const id of ['a', 'b']) {
+      if (kind === 'signed out') f.accounts.find(account => account.id === id)!.needsAuth = true
+      if (kind === 'expired token') f.credentials.find(value => value.id === id)!.expiresAt = f.now()
+    }
+    await f.controller.reclaim(provider)
+    expect(f.activate.mock.calls.map(call => call[1])).toEqual(['b', 'key'])
+    expect(f.state.sticky[provider]).toBe('key')
+  })
+
+  it('checks for a return at most once a minute', async () => {
+    const f = fixture(provider)
+    await onPaidKey(f)
+    f.advance(3_600_001)
+    f.setMonitor(() => new Response(JSON.stringify(monitorBody(provider, f.now(), 100))))
+    await f.controller.reclaim(provider)
+    for (const id of ['a', 'b']) delete f.state.usage[`${provider}:${id}`]
+    f.advance(59_000)
+    await f.controller.reclaim(provider)
+    expect(f.activate.mock.calls.map(call => call[1])).toEqual(['b', 'key'])
+    f.advance(1_000)
+    f.setMonitor(() => new Response(JSON.stringify(monitorBody(provider, f.now()))))
+    await f.controller.reclaim(provider)
+    expect(f.activate.mock.calls.at(-1)?.[1]).toBe('a')
+  })
+
+  it('does not let prompts made on a subscription delay leaving the key', async () => {
+    const f = fixture(provider)
+    await f.controller.initialize(provider)
+    await f.controller.reclaim(provider)
+    await onPaidKey(f)
+    f.state.cooldowns = {}
+    await f.controller.reclaim(provider)
+    expect(f.activate.mock.calls.map(call => call[1])).toEqual(['b', 'key', 'a'])
+  })
+
+  it('makes concurrent prompts wait for one shared return instead of sending on the key', async () => {
+    const f = fixture(provider)
+    await onPaidKey(f)
+    f.advance(3_600_001)
+    const seen: string[] = []
+    await Promise.all([0, 1, 2].map(async () => { await f.controller.reclaim(provider); seen.push(f.accounts.find(account => account.active)!.id) }))
+    expect(seen).toEqual(['a', 'a', 'a'])
+    expect(f.activate.mock.calls.map(call => call[1])).toEqual(['b', 'key', 'a'])
+  })
+
+  it('leaves a subscription or an unauthorized key alone', async () => {
+    const onSubscription = fixture(provider)
+    await onSubscription.controller.initialize(provider)
+    await onSubscription.controller.reclaim(provider)
+    expect(onSubscription.activate).not.toHaveBeenCalled()
+    const unauthorized = fixture(provider, { settings: { allowPaidFallback: false, apiKeyAccountID: undefined, apiKeyModels: [] } })
+    unauthorized.setActive('key')
+    await unauthorized.controller.initialize(provider)
+    await unauthorized.controller.reclaim(provider)
+    expect(unauthorized.activate).not.toHaveBeenCalled()
+  })
+
+  it('fails over from a paid key that runs out of credit back to a usable subscription', async () => {
+    const f = fixture(provider)
+    await onPaidKey(f)
+    f.advance(3_600_001)
+    const body = provider === 'anthropic'
+      ? JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.' } })
+      : JSON.stringify({ error: { type: 'insufficient_quota', code: 'insufficient_quota', message: 'You exceeded your current quota.' } })
+    const status = provider === 'anthropic' ? 400 : 429
+    const { input } = await f.reject('key', { body, status, headers: {} })
+    input.error.type = provider === 'anthropic' ? 'provider.invalid-request' : 'provider.quota'
+    expect(await f.controller.onRetry(input)).toBe(true)
+    expect(input.decision).toEqual({ retry: true, delay: 0 })
+    expect(f.activate.mock.calls.at(-1)?.[1]).toBe('a')
+  })
+
+  it('does not treat an ordinary invalid request as a reason to leave the paid key', async () => {
+    const f = fixture(provider)
+    await onPaidKey(f)
+    f.advance(3_600_001)
+    const body = JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'messages: field required' } })
+    const { input } = await f.reject('key', { body, status: 400, headers: {} })
+    input.error.type = 'provider.invalid-request'
+    expect(await f.controller.onRetry(input)).toBe(false)
+    expect(f.activate.mock.calls.map(call => call[1])).toEqual(['b', 'key'])
+  })
+
   it('never persists access tokens, API keys, credential metadata, request/response bodies or auth headers', async () => {
     const f = fixture(provider, { cold: true })
     await f.controller.initialize(provider)

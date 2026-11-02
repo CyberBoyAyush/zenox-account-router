@@ -40,6 +40,8 @@ function classify(status: number, headers: Headers, body: unknown): QuotaEvidenc
   if (/extra[ _-]?usage|long[ _-]?context|fast[ _-]?mode|\b(?:opus|sonnet|haiku)\b|\bmodel(?:-specific| restriction| usage| limit| unavailable| is not| not supported)/.test(text) || types.some(value => /extra_usage|long_context|fast_mode|usage_not_included|model_restriction/.test(value))) {
     return { kind: 'model-restriction', scope: 'model' }
   }
+  // An API key with an empty prepaid balance is rejected with 400 (or 402 billing_error), never 429.
+  if (/credit balance is too low/.test(text) || types.includes('billing_error')) return { kind: 'quota', scope: 'account', code: 'credit_balance' }
   if (status !== 429) return { kind: 'unknown', scope: 'account' }
   if (/requests? per minute|tokens? per minute|\brpm\b|\btpm\b|too many requests|rate limit per/.test(text)) return { kind: 'transient', scope: 'account' }
   const rejected: number[] = []

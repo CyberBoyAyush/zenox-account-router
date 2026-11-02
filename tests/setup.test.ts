@@ -314,6 +314,24 @@ describe('consent-driven onboarding', () => {
     expect(injected.readCredentials).not.toHaveBeenCalled()
   }))
 
+  it('explains whether a dry run would leave an active paid key for a subscription', async () => temporary(async directory => {
+    const path = join(directory, 'router.json')
+    const paid = configured()
+    paid.providers.anthropic = { ...paid.providers.anthropic!, apiKeyAccountID: 'key-a', allowPaidFallback: true, apiKeyModels: ['claude-sonnet-5-5'] }
+    await saveConfig(paid, path)
+    const onKey: CredentialSource = { listAccounts: vi.fn(async () => accounts.map(account => ({ ...account, active: account.id === 'key-a' }))), readCredentials: vi.fn(async () => []) }
+    const output = vi.fn()
+    await runCLI(['dry-run', '--config', path], { source: onKey, output, now: () => 1234, color: false })
+    expect(output.mock.calls.at(-1)![0]).toMatch(/Uses {5}Personal\n/)
+    expect(output.mock.calls.at(-1)![0]).toContain('A subscription is usable again, so the next prompt leaves the paid key.')
+    const state = emptyState()
+    for (const id of ['oauth-a', 'oauth-b']) state.cooldowns[`anthropic:${id}`] = { until: 1234 + 3_600_000, confirmedAt: 1234 }
+    await saveState(state, defaultStatePath(path))
+    await runCLI(['dry-run', '--config', path], { source: onKey, output, now: () => 1234, color: false })
+    expect(output.mock.calls.at(-1)![0]).toMatch(/Uses {5}API\n/)
+    expect(output.mock.calls.at(-1)![0]).toContain('The paid key is in use until a subscription is usable again.')
+  }))
+
   it('lists accounts grouped by provider with IDs on their own line', async () => {
     const output = vi.fn()
     await runCLI(['accounts'], { source: source(), output, color: false })

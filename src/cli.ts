@@ -117,7 +117,14 @@ export async function runCLI(args = process.argv.slice(2), dependencies: { sourc
     const accounts: Account[] = settings.accountIDs.map(id => ({ id, provider, label: id, method: 'oauth', active: current === id, ...(listed(id)?.needsAuth ? { needsAuth: true } : {}) }))
     if (settings.apiKeyAccountID) accounts.push({ id: settings.apiKeyAccountID, provider, label: settings.apiKeyAccountID, method: 'key', active: false })
     const usage = selectedUsage(state, provider, settings.accountIDs)
-    choices.push({ provider, ...(settings.allowPaidFallback && settings.apiKeyAccountID && current === settings.apiKeyAccountID ? { accountID: settings.apiKeyAccountID, kind: 'paid', reason: 'Keep the saved paid fallback sticky; no automatic return to a subscription.' } : chooseInitial(settings, accounts, usage, now)) })
+    if (settings.allowPaidFallback && settings.apiKeyAccountID && current === settings.apiKeyAccountID) {
+      // Mirrors the controller's reclaim: leave the key once a subscription is out of cooldown and not exhausted.
+      const ready = accounts.filter(account => account.method === 'oauth' && !((state.cooldowns[`${provider}:${account.id}`]?.until ?? 0) > now))
+      const back = chooseInitial(settings, ready, usage, now).accountID
+      choices.push({ provider, ...(back ? { accountID: back, kind: 'return', reason: 'Return from the paid key to a usable subscription at the next prompt.' } : { accountID: settings.apiKeyAccountID, kind: 'paid', reason: 'Keep the paid key until a selected subscription is usable again.' }) })
+      continue
+    }
+    choices.push({ provider, ...chooseInitial(settings, accounts, usage, now) })
   }
   if (options.json) {
     output(JSON.stringify({ choices, refreshed: options.refresh, activated: false }, null, 2))
@@ -128,7 +135,8 @@ export async function runCLI(args = process.argv.slice(2), dependencies: { sourc
     sticky: 'It is in use, so the router stays on it until it runs out.',
     favorite: 'Nothing is in use yet, so it starts with your favorite.',
     best: 'Nothing is in use yet, so it picks the one with most room left.',
-    paid: 'The paid key is in use. It stays until you switch back.',
+    paid: 'The paid key is in use until a subscription is usable again.',
+    return: 'A subscription is usable again, so the next prompt leaves the paid key.',
     none: 'No selected subscription is usable right now.',
   }
   const lines: Line[] = [[{ text: 'Zenox Account Router', tone: 'strong' }, { text: '  ·  dry run, nothing is switched', tone: 'muted' }]]

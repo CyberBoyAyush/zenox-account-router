@@ -278,6 +278,14 @@ describe('inference classification', () => {
     expect(anthropicAdapter.classify(429, new Headers(), { error: { message } }, now)).toMatchObject({ kind: 'model-restriction', scope: 'model' })
   })
 
+  it('treats an Anthropic key with an empty credit balance as account exhaustion', () => {
+    const message = 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'
+    expect(anthropicAdapter.classify(400, new Headers(), { type: 'error', error: { type: 'invalid_request_error', message } }, now)).toEqual({ kind: 'quota', scope: 'account', code: 'credit_balance' })
+    expect(anthropicAdapter.classify(402, new Headers(), { type: 'error', error: { type: 'billing_error', message: 'Payment required' } }, now)).toEqual({ kind: 'quota', scope: 'account', code: 'credit_balance' })
+    expect(anthropicAdapter.classify(400, new Headers(), { type: 'error', error: { type: 'invalid_request_error', message: 'messages: field required' } }, now).kind).toBe('unknown')
+    expect(anthropicAdapter.classify(429, new Headers(), { error: { message: 'Extra usage credit balance is too low for long context' } }, now)).toMatchObject({ kind: 'model-restriction', scope: 'model' })
+  })
+
   it.each(['Too many requests', 'Tokens per minute limit exceeded', 'RPM limit reached', 'Please retry later'])('does not mistake transient Anthropic errors for quota: %s', message => {
     expect(anthropicAdapter.classify(429, new Headers(), { error: { message } }, now).kind).toBe('transient')
     expect(anthropicAdapter.classify(500, new Headers(), { error: { message: 'Weekly usage limit reached' } }, now).kind).toBe('unknown')

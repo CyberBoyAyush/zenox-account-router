@@ -232,7 +232,10 @@ export const accountRouter: Plugin.Plugin = {
       }))
       registrations.push(await ctx.session.hook('prompt', event => safely(async () => {
         const session = await ctx.session.get({ sessionID: event.sessionID })
-        if (session.model && controlled(config, session.model.providerID)) await controller.initialize(session.model.providerID)
+        if (session.model && controlled(config, session.model.providerID)) {
+          await controller.initialize(session.model.providerID)
+          await controller.reclaim(session.model.providerID)
+        }
       })))
       registrations.push(await ctx.session.hook('http.request', event => safely(() => controller.onRequest(event, event.request))))
       registrations.push(await ctx.session.hook('http.response', event => safely(() => controller.onResponse(event, event.request, event.response))))

@@ -3,7 +3,7 @@ import { emptyState } from './config.js'
 import { chooseInitial, usageBlocks } from './policy.js'
 import { adapters } from './providers/index.js'
 import { readBoundedJson } from './providers/shared.js'
-import type { Account, Fetch, ProviderAdapter, ProviderID, QuotaEvidence, RouterConfig, RouterHost, RouterState, StoredCredential, UsageSnapshot } from './types.js'
+import type { Account, Fetch, ProviderAdapter, ProviderConfig, ProviderID, QuotaEvidence, RouterConfig, RouterHost, RouterState, StoredCredential, UsageSnapshot } from './types.js'
 
 export interface RequestScope {
   sessionID: string
@@ -57,6 +57,8 @@ export class RouterController {
   private readonly reading = new Map<string, Promise<StoredCredential[]>>()
   private readonly requests = new WeakMap<Request, RequestRecord>()
   private readonly scopes = new Map<string, ScopeState>()
+  private readonly reclaimed = new Map<ProviderID, number>()
+  private readonly reclaiming = new Map<ProviderID, Promise<void>>()
   private readonly abort = new AbortController()
 
   constructor(options: { config: RouterConfig; host: RouterHost; state?: RouterState; now?: () => number; fetch?: Fetch; adapters?: Record<ProviderID, ProviderAdapter>; persist?: (state: RouterState) => Promise<void> }) {
@@ -251,7 +253,9 @@ export class RouterController {
     if (!provider || !settings || this.suspended.has(provider) || this.abort.signal.aborted) return false
     const current = this.scopes.get(scopeKey(input))
     const rejection = current?.rejection
-    if (!current || !rejection || rejection.generation !== current.generation || this.now() - rejection.at > 30_000 || rejection.status !== input.error.status || digest(input.error.response?.body) !== rejection.digest || !['provider.quota', 'provider.rate-limit'].includes(input.error.type)) return false
+    // OpenCode reports Anthropic's 400 "credit balance is too low" as an invalid request.
+    const types = ['provider.quota', 'provider.rate-limit', ...(rejection?.evidence.code === 'credit_balance' ? ['provider.invalid-request'] : [])]
+    if (!current || !rejection || rejection.generation !== current.generation || this.now() - rejection.at > 30_000 || rejection.status !== input.error.status || digest(input.error.response?.body) !== rejection.digest || !types.includes(input.error.type)) return false
     current.rejection = undefined
     if (!Number.isInteger(input.attempt) || input.attempt < 1 || input.attempt > Math.min(8, settings.accountIDs.length + 1)) return false
     if (input.attempt <= current.lastAttempt) current.visited.clear()
@@ -302,6 +306,48 @@ export class RouterController {
       input.decision = { retry: true, delay: settled === false ? 3_000 : 0 }
       await this.save()
       return true
+    })
+  }
+
+  /**
+   * The paid key is a last resort. At a prompt boundary (never on a timer), before that prompt's requests are
+   * built, move back to a selected subscription once one is signed in and no longer cooling down or reported
+   * exhausted. Switches are provider-global, so another session's in-flight request may still finish on the key.
+   */
+  async reclaim(provider: ProviderID): Promise<void> {
+    const settings = this.config.providers[provider]
+    if (!settings?.allowPaidFallback || !settings.apiKeyAccountID || !this.initialized.has(provider) || this.suspended.has(provider) || this.abort.signal.aborted) return
+    // Concurrent prompts wait for the same check instead of sending on the key meanwhile.
+    const pending = this.reclaiming.get(provider)
+    if (pending) return pending
+    const keyID = settings.apiKeyAccountID
+    const onKey = (accounts: Account[]): boolean => accounts.some(account => account.provider === provider && account.active && account.method === 'key' && account.id === keyID)
+    const operation = (async () => {
+      if (!onKey(await this.host.listAccounts())) return
+      const started = this.now()
+      if (started - (this.reclaimed.get(provider) ?? -Infinity) < 60_000) return
+      this.reclaimed.set(provider, started)
+      await this.leaveKey(provider, settings, onKey)
+    })().finally(() => this.reclaiming.delete(provider))
+    this.reclaiming.set(provider, operation)
+    return operation
+  }
+
+  private async leaveKey(provider: ProviderID, settings: ProviderConfig, onKey: (accounts: Account[]) => boolean): Promise<void> {
+    await this.refresh(provider)
+    await this.serial(async () => {
+      const accounts = await this.host.listAccounts()
+      if (!onKey(accounts) || this.abort.signal.aborted) return
+      const now = this.now()
+      const candidates = this.selected(provider, accounts).filter(account => account.method === 'oauth' && !account.needsAuth && !this.blocked(provider, account.id, now))
+      if (!candidates.length) return
+      const credentials = await this.readCredentials(provider, { refresh: true })
+      const usable = candidates.filter(account => credentials.some(value => value.id === account.id && value.method === 'oauth' && !value.needsAuth && !!value.access && (!value.expiresAt || value.expiresAt > now)))
+      const choice = chooseInitial(settings, usable.map(account => ({ ...account, active: false })), Object.values(this.state.usage), now).accountID
+      if (!choice || !onKey(await this.host.listAccounts())) return
+      await this.host.activate(provider, choice)
+      this.state.sticky[provider] = choice
+      await this.save()
     })
   }
 

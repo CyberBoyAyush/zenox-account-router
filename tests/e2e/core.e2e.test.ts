@@ -125,6 +125,33 @@ describe.each(providers)('%s through real OpenCode core', provider => {
     expect(await harness.active(provider)).toBe('cred_b')
   }, 60_000)
 
+  it('leaves an active paid key for a usable subscription before the next prompt is sent', async () => {
+    harness = await start({
+      router: { [provider]: { accountIDs: ['cred_a', 'cred_b'], apiKeyAccountID: 'cred_key', allowPaidFallback: true, apiKeyModels: [MODELS[provider]] } },
+      credentials: { [provider]: [...accounts(), key('cred_key')] },
+    })
+    expect(await harness.active(provider)).toBe('cred_key')
+    const result = await harness.run(provider)
+    expect(result.text).toBe('fake success')
+    const primaries = harness.primaries(provider)
+    expect(primaries.map(call => call.authorization)).toEqual([bearer('cred_a')])
+    if (provider === 'openai') expect(primaries.map(call => call.workspace)).toEqual(['ws-cred_a'])
+    expect(primaries.every(call => call.apiKey === null)).toBe(true)
+    expect(await harness.active(provider)).toBe('cred_a')
+  }, 60_000)
+
+  it('stays on the paid key while every subscription is reported exhausted', async () => {
+    harness = await start({
+      router: { [provider]: { accountIDs: ['cred_a', 'cred_b'], apiKeyAccountID: 'cred_key', allowPaidFallback: true, apiKeyModels: [MODELS[provider]] } },
+      credentials: { [provider]: [...accounts(), key('cred_key')] },
+    })
+    harness.respond(call => call.kind === 'usage' ? usage(provider, 100) : undefined)
+    const result = await harness.run(provider)
+    expect(result.text).toBe('fake success')
+    expect(harness.primaries(provider).every(call => !call.authorization?.startsWith('Bearer access-'))).toBe(true)
+    expect(await harness.active(provider)).toBe('cred_key')
+  }, 60_000)
+
   it('does not take over when the active account is outside the selected set', async () => {
     harness = await start({ router: { [provider]: { accountIDs: ['cred_a', 'cred_b'] } }, credentials: { [provider]: [...accounts(), oauth(provider, 'cred_manual')] } })
     harness.respond(quotaFor('cred_manual'))
@@ -142,6 +169,31 @@ describe.each(providers)('%s through real OpenCode core', provider => {
     expect(await harness.active(provider)).toBe('cred_b')
     const successes = harness.primaries(provider).filter(call => call.authorization === bearer('cred_b'))
     expect(successes.length).toBeGreaterThanOrEqual(2)
+  }, 60_000)
+})
+
+describe('anthropic empty credit balance through real OpenCode core', () => {
+  const credit = (): Response => Response.json({ type: 'error', error: { type: 'invalid_request_error', message: 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.' } }, { status: 400 })
+
+  it('routes the non-retryable 400 through the retry hook and moves to a usable account', async () => {
+    harness = await start({ router: { anthropic: { accountIDs: ['cred_a', 'cred_b'] } }, credentials: { anthropic: [oauth('anthropic', 'cred_b'), oauth('anthropic', 'cred_a')] } })
+    harness.respond(call => call.kind === 'inference' && call.primary && call.authorization === bearer('cred_a') ? credit() : undefined)
+    const result = await harness.run('anthropic')
+    expect(result.text).toBe('fake success')
+    expect(harness.primaries('anthropic').map(call => call.authorization)).toEqual([bearer('cred_a'), bearer('cred_b')])
+    expect(await harness.active('anthropic')).toBe('cred_b')
+  }, 60_000)
+
+  it('stops with the error when the empty key has no usable subscription to return to', async () => {
+    harness = await start({
+      router: { anthropic: { accountIDs: ['cred_a', 'cred_b'], apiKeyAccountID: 'cred_key', allowPaidFallback: true, apiKeyModels: [MODELS.anthropic] } },
+      credentials: { anthropic: [oauth('anthropic', 'cred_b'), oauth('anthropic', 'cred_a'), key('cred_key')] },
+    })
+    harness.respond(call => call.kind === 'usage' ? usage('anthropic', 100) : call.kind === 'inference' && call.primary && call.apiKey ? credit() : undefined)
+    const result = await harness.run('anthropic')
+    expect(result.failed).toBe(true)
+    expect(harness.primaries('anthropic').every(call => call.apiKey === 'sk-synthetic-cred_key')).toBe(true)
+    expect(await harness.active('anthropic')).toBe('cred_key')
   }, 60_000)
 })
 

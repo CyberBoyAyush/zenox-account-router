@@ -43,18 +43,18 @@ To test a local tarball before publishing:
 
 ```sh
 pnpm pack
-npx --yes --package ./zenox-account-router-0.1.0.tgz zenox-account-router setup --plugin "$PWD"
+npx --yes --package ./zenox-account-router-0.2.0.tgz zenox-account-router setup --plugin "$PWD"
 ```
 
 `--plugin "$PWD"` points to the durable built checkout rather than a disposable npx cache. Setup also accepts `--config PATH` (recorded as the plugin's `configPath` option) and `--server URL` (used only by the CLI to list accounts from that OpenCode server). For a remote server, install the plugin and preferences on that server machine; the plugin always reads accounts from the OpenCode instance that loads it.
 
 ## Selection and retry policy
 
-1. Preserve an already active selected OAuth account. Preserve an explicitly authorized active fallback key; never automatically switch back on a timer.
+1. Preserve an already active selected OAuth account; never rebalance between subscriptions. The paid key is the exception: at each prompt boundary (at most once a minute, never on a timer), before that prompt's requests are built, the router leaves an active fallback key for a selected subscription that is signed in, has a usable token, is out of cooldown and is not reported exhausted. Concurrent prompts share one check. This also applies to a key chosen manually while paid fallback is enabled; disabling paid fallback leaves an active key alone. Switches are provider-global, so another session's in-flight request can still complete on the key.
 2. When an initial choice is needed, use an eligible favorite, otherwise prefer a fresh running five-hour window and then more weekly allowance remaining. Deterministic ties follow the selected account order. Unknown monitoring does not authorize payment.
 3. Monitor actual outgoing HTTP authorization and, for OpenAI OAuth, workspace identity. Only a unique match to a selected credential is eligible for routing.
 4. Inspect bounded clones of rejected primary HTTP responses. Match status and a digest of the response body to the retry error; consume rejection evidence once. Auxiliary, overlapping, stale, unrecognized, accepted-stream, authentication, temporary-capacity, and ambiguous errors do not trigger account rotation.
-5. On confirmed relevant account quota exhaustion, record a cooldown and retry a different eligible selected OAuth account. An Anthropic auth-plugin diagnostic that lost the original restriction text requires rejected-window headers or a bounded fresh usage corroboration; generic `429` never suffices.
+5. On confirmed relevant account quota exhaustion, record a cooldown and retry a different eligible selected OAuth account. An Anthropic auth-plugin diagnostic that lost the original restriction text requires rejected-window headers or a bounded fresh usage corroboration; generic `429` never suffices. An Anthropic key with an empty prepaid balance (`400` "credit balance is too low", which OpenCode reports as `provider.invalid-request`, or `402 billing_error`) counts as account exhaustion so routing can leave the key.
 6. Activate a key only when every selected OAuth account has recent confirmed exhaustion, paid fallback was explicitly enabled, and the current exact model ID is in the operator's API model allowlist. A rounded percentage alone cannot authorize payment. Missing, expired, inaccessible, or unknown accounts do not count as exhausted. No model/provider substitutions are made.
 7. Serialize switches process-wide and re-check the globally active ID immediately before activation. Honor another selected account's concurrent switch; suspend routing if the active account was changed to an unselected one. Bound account visits/retries; OpenCode's own retry ceiling also applies.
 
