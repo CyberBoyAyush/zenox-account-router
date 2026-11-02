@@ -173,7 +173,7 @@ pnpm test:coverage
 The test suite (350+ tests) includes:
 
 - **Unit and integration tests** for the usage readers, quota classifiers, policy, controller, onboarding and CLI.
-- **End-to-end tests against the real OpenCode engine** (embedded `@opencode/sdk`, in-memory database, fake accounts, all network intercepted) covering failover, throttling, paid fallback, concurrency, token refresh and stream safety for both providers.
+- **End-to-end tests against the real OpenCode engine** (embedded `@opencode/sdk`, in-memory database, fake accounts, all network intercepted) covering failover, throttling, paid fallback, concurrency, token refresh and stream safety for both providers. These need Node 24+ and are skipped automatically on Node 22.
 - **Property-based fuzzing** with fast-check for parsers, classifiers and random multi-session event sequences.
 
 Design notes and verification details: [`docs/implementation.md`](./docs/implementation.md).
