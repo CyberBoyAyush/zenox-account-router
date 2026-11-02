@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest'
+import { RouterRpc } from '../../src/rpc.js'
 import type { ProviderID } from '../../src/types.js'
 import { blockedSockets, key, MODELS, modelRestriction, oauth, start, success, transient, usage, weeklyQuota } from './harness.js'
 import type { Harness } from './harness.js'
@@ -39,6 +40,12 @@ describe.each(providers)('%s through real OpenCode core', provider => {
     const state = await harness.state()
     expect(state.usage[`${provider}:cred_a`]?.status).toBe('ok')
     expect(JSON.stringify(state)).not.toMatch(/access-|refresh-|sk-synthetic/)
+    // The status RPC behind /router-status, called through real OpenCode routing.
+    const status = await harness.sdk.rpc(RouterRpc).status({}, { location: harness.location }) as { text: string; report: { providers: { accounts: { id: string; active: boolean }[] }[] } }
+    expect(status.report.providers[0]!.accounts.map(account => [account.id, account.active])).toEqual([['cred_a', true], ['cred_b', false]])
+    expect(status.text).toContain('● Synthetic cred_a  [ACTIVE]')
+    expect(status.text).toMatch(/Weekly\s+█+░+ 10%\s+used/)
+    expect(status.text).not.toMatch(/access-|refresh-/)
   }, 60_000)
 
   it('fails over A → B on confirmed quota exhaustion, then stays on B', async () => {

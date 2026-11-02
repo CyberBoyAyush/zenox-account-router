@@ -114,7 +114,7 @@ describe('default plugin spec for installation', () => {
       await mkdir(root, { recursive: true })
       await writeFile(join(root, 'package.json'), JSON.stringify({ name }))
     }
-    expect(await defaultPluginSpec(published, directory)).toBe(PACKAGE_NAME)
+    expect(await defaultPluginSpec(published, directory)).toBe(`${PACKAGE_NAME}@latest`)
     expect(await defaultPluginSpec(checkout, checkout)).toBe(checkout)
     expect(await defaultPluginSpec(checkout, directory)).toBeUndefined()
     expect(await defaultPluginSpec(other, other)).toBeUndefined()
@@ -130,6 +130,14 @@ describe('JSONC plugin installation', () => {
     expect(updated).toContain('// Auth first')
     expect(parseJSONC(updated)).toEqual({ model: 'anthropic/model', plugins: [{ package: 'auth-plugin', options: { keep: true } }, 'other-plugin', '/durable/router'] })
     expect(appendPlugin(updated, '/durable/router')).toBe(updated)
+  })
+
+  it('treats any version tag or entry form of the same package as already installed', () => {
+    const objectForm = '{"plugins":["zenox@latest",{"package":"zenox-account-router","options":{"configPath":"/x"}}]}'
+    expect(appendPlugin(objectForm, 'zenox-account-router@latest')).toBe(objectForm)
+    const pinned = '{"plugins":["zenox-account-router@0.1.0"]}'
+    expect(appendPlugin(pinned, 'zenox-account-router@latest')).toBe(pinned)
+    expect(parseJSONC(appendPlugin('{"plugins":["zenox@latest"]}', 'zenox-account-router@latest'))).toEqual({ plugins: ['zenox@latest', 'zenox-account-router@latest'] })
   })
 
   it('does not duplicate object-form plugin references or mutate invalid configurations', () => {

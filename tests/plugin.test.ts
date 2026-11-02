@@ -147,6 +147,12 @@ function context(path: string, provider: ProviderID = 'anthropic', values = cred
     callback({ add: command => { commands.push(command) } })
     return registration(() => { commands.length = 0 })
   }
+  const rpc: { id?: string; status?: (input: unknown) => Promise<unknown> } = {}
+  const rpcRegister = vi.fn(async (definition: { id: string }, handlers: { status: (input: unknown, context: unknown) => Promise<unknown> }) => {
+    rpc.id = definition.id
+    rpc.status = input => handlers.status(input, { signal: new AbortController().signal })
+    return { ...registration(() => { delete rpc.status }), events: { emit: async () => {} } }
+  })
   const resolve = vi.fn<Resolve>(async connection => {
     const value = connection.type === 'credential' ? values.find(item => item.id === connection.id) : undefined
     return value ? structuredClone(stored(value)) : undefined
@@ -163,7 +169,7 @@ function context(path: string, provider: ProviderID = 'anthropic', values = cred
   const providerGet = vi.fn<ProviderGet>(async () => providerResult(activeHeaders(), activeValue()?.method === 'key' ? PLATFORM : CODEX))
   const ctx = {
     app: { version: '2.2.5' }, options: { configPath: path }, integration: { get, connection: { resolve } }, credential: { activate },
-    session: { hook, get: sessionGet, synthetic }, provider: { transform: providerTransform, get: providerGet }, model: { transform: modelTransform }, command: { transform: commandTransform },
+    session: { hook, get: sessionGet, synthetic }, provider: { transform: providerTransform, get: providerGet }, model: { transform: modelTransform }, command: { transform: commandTransform }, rpc: { register: rpcRegister },
   } as unknown as Plugin.Context
   const resolvedIDs = (): string[] => resolve.mock.calls.map(([connection]) => connection.type === 'credential' ? connection.id : connection.type)
   async function emit<Name extends HookName>(name: Name, event: SessionHooks[Name]): Promise<void> {
@@ -184,7 +190,7 @@ function context(path: string, provider: ProviderID = 'anthropic', values = cred
     }
     return undefined
   }
-  return { ctx, connections, hooks, hookOptions, registrations, commands, providerTransforms, modelTransforms, get, activate, synthetic, sessionGet, resolve, resolvedIDs, providerGet, activeHeaders, values, emit, prompt, setup }
+  return { ctx, connections, hooks, hookOptions, registrations, commands, rpc, rpcRegister, providerTransforms, modelTransforms, get, activate, synthetic, sessionGet, resolve, resolvedIDs, providerGet, activeHeaders, values, emit, prompt, setup }
 }
 
 function usageFetch() {
@@ -305,17 +311,25 @@ describe('real Plugin.define account-router setup', () => {
     expect(f.activate).not.toHaveBeenCalled()
   })
 
-  it('status command adds a synthetic message with resume:false and never runs inference', async () => {
-    const f = context(await configFile(config('anthropic')))
+  it('registers no server slash command; status is served over the router RPC without inference or switching', async () => {
+    const monitor = usageFetch()
+    const f = context(await configFile(config('anthropic', { allowPaidFallback: false })))
     await f.setup()
-    expect(f.commands).toHaveLength(1)
-    expect(f.commands[0]!.name).toBe('router-status')
-    await f.commands[0]!.execute({ sessionID: scope('anthropic').sessionID } as Parameters<CommandDefinition['execute']>[0])
-    expect(f.synthetic).toHaveBeenCalledWith({ sessionID: scope('anthropic').sessionID, text: expect.any(String), resume: false })
+    expect(f.commands).toHaveLength(0)
+    expect(f.rpc.id).toBe('zenox-account-router')
+    const offline = await f.rpc.status!({}) as { text: string; report: { providers: { accounts: { id: string; active: boolean }[] }[] } }
+    expect(monitor).not.toHaveBeenCalled()
+    expect(offline.report.providers[0]!.accounts.map(account => [account.id, account.active])).toEqual([['a', true], ['b', false]])
+    expect(offline.text).toContain('Anthropic · paid fallback off')
+    expect(offline.text).toContain('● Synthetic a  [ACTIVE]')
+    expect(offline.text).toContain('usage not checked yet')
+    const live = await f.rpc.status!({ refresh: true }) as { text: string }
+    expect(monitor).toHaveBeenCalledTimes(2)
+    expect(live.text).toMatch(/5-hour\s+█+░+ 20%\s+used · resets in 5h 0m/)
+    expect(live.text).not.toMatch(/synthetic-anthropic-[ab]\b|synthetic-refresh/)
+    expect(f.synthetic).not.toHaveBeenCalled()
     expect(f.sessionGet).not.toHaveBeenCalled()
     expect(f.activate).not.toHaveBeenCalled()
-    expect(f.get).not.toHaveBeenCalled()
-    expect(fetch).not.toHaveBeenCalled()
   })
 })
 
@@ -508,7 +522,7 @@ describe('shared controller and registration lifecycle', () => {
     expect(second.resolve).not.toHaveBeenCalled()
     await disposeFirst!()
     expect(first.hooks.size).toBe(0)
-    expect(first.commands).toHaveLength(0)
+    expect(first.rpc.status).toBeUndefined()
     expect(first.providerTransforms).toHaveLength(0)
     expect(first.modelTransforms).toHaveLength(0)
     expect(vi.getTimerCount()).toBe(1)

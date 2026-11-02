@@ -1,6 +1,6 @@
 {
   "name": "zenox-account-router",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Sticky, quota-aware account failover for OpenCode V2 — Claude and ChatGPT subscriptions first, optional paid API key last.",
   "keywords": [
     "opencode",
@@ -35,12 +35,20 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./tui": {
+      "types": "./dist/tui.d.ts",
+      "import": "./dist/tui.js"
+    },
+    "./rpc": {
+      "types": "./dist/rpc.d.ts",
+      "import": "./dist/rpc.js"
     }
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "bin": {
-    "zenox-account-router": "./dist/cli.js"
+    "zenox-account-router": "dist/cli.js"
   },
   "files": [
     "dist",

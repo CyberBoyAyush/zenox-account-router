@@ -3,7 +3,8 @@ import { resolve } from 'node:path'
 import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { defaultConfigPath, defaultStatePath, loadConfig, readState, saveState } from './config.js'
-import { cleanLabel, displayAccounts, displayStatus } from './display.js'
+import { cleanLabel, displayAccounts } from './display.js'
+import { buildReport, formatReport } from './report.js'
 import { createCredentialSource } from './opencode.js'
 import { runSetup } from './setup.js'
 import { PROVIDERS } from './types.js'
@@ -86,7 +87,7 @@ export async function runCLI(args = process.argv.slice(2), dependencies: { sourc
     await saveState(state, statePath)
   }
   if (options.command === 'status') {
-    output(options.json ? JSON.stringify({ config, state, refreshed: options.refresh }, null, 2) : displayStatus(config, state).replace('Saved state only; use --refresh to request live usage.', options.refresh ? 'Usage refreshed explicitly. No accounts were activated.' : 'Saved state only; use --refresh to request live usage.'))
+    output(options.json ? JSON.stringify({ config, state, refreshed: options.refresh }, null, 2) : formatReport(buildReport(config, state, { now, live: options.refresh })))
     return
   }
   let chooseInitial = dependencies.chooseInitial

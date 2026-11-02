@@ -59,11 +59,23 @@ The wizard walks you through:
 
 Nothing is written until you confirm the summary. Cancel at any point and no files change.
 
-**3. Use OpenCode normally.** Check the router any time with:
+**3. Use OpenCode normally.** Check the router any time with `/router-status` (or `/router`, or *Router: account status* in the command palette). It opens a dialog like this:
 
 ```text
-/router-status
+Anthropic · paid fallback off
+● Claude Personal  [ACTIVE]
+    5-hour  ████████░░░░░░ 57%  used · resets in 2h 14m
+    Weekly  ███░░░░░░░░░░░ 19%  used · resets in 5d 18h
+    checked just now
+○ Claude Team  [standby]
+    5-hour  ░░░░░░░░░░░░░░ 0%   used · not started
+    Weekly  ███░░░░░░░░░░░ 22%  used · resets in 4d 21h
+    checked just now
+
+Usage refreshes every 10m while you're active.
 ```
+
+Accounts that hit their limit show `cooling down` with the time left; a paid key shows as `paid API key`.
 
 ## How it decides
 
@@ -127,12 +139,12 @@ and registers the plugin in your global OpenCode config:
 {
   "plugins": [
     "@ex-machina/opencode-anthropic-auth@next",
-    "zenox-account-router"
+    "zenox-account-router@latest"
   ]
 }
 ```
 
-Keep the router **after** your auth plugins. After editing preferences, run `/reload` in OpenCode.
+Keep the router **after** your auth plugins. Any form works — `"zenox-account-router"`, `"zenox-account-router@latest"`, or `{ "package": "zenox-account-router", "options": { "configPath": "…" } }` when you keep preferences somewhere else. Unpinned entries pick up new versions via `opencode plugin update`. After editing preferences, run `/reload` in OpenCode.
 
 ## Usage monitoring
 

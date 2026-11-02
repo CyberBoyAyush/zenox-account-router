@@ -3,7 +3,8 @@ import { resolve } from 'node:path'
 import { createHash } from 'node:crypto'
 import { defaultConfigPath, defaultStatePath, loadConfig, readState, saveState } from './config.js'
 import { RouterController } from './controller.js'
-import { displayStatus } from './display.js'
+import { buildReport, formatReport } from './report.js'
+import { RouterRpc } from './rpc.js'
 import { PROVIDERS } from './types.js'
 import type { Account, ProviderID, RouterConfig, RouterHost, StoredCredential } from './types.js'
 
@@ -236,11 +237,17 @@ export const accountRouter: Plugin.Plugin = {
       registrations.push(await ctx.session.hook('http.request', event => safely(() => controller.onRequest(event, event.request))))
       registrations.push(await ctx.session.hook('http.response', event => safely(() => controller.onResponse(event, event.request, event.response))))
       registrations.push(await ctx.session.hook('retry', event => safely(() => controller.onRetry(event))))
-      registrations.push(await ctx.command.transform(editor => {
-        editor.add({
-          name: 'router-status', description: 'Show cached account-router usage without inference or account switching.',
-          execute: async ({ sessionID }) => { await ctx.session.synthetic({ sessionID, text: displayStatus(config, controller.state), resume: false }) },
-        })
+      // The terminal UI part calls this to render `/router-status`; it never sends inference or switches accounts.
+      registrations.push(await ctx.rpc.register(RouterRpc, {
+        status: async input => {
+          const refresh = typeof input === 'object' && input !== null && 'refresh' in input && input.refresh === true
+          // Due checks only: monitoring still respects the polling interval and backoff.
+          if (refresh) await within(Promise.all(PROVIDERS.filter(provider => config.providers[provider]).map(provider => controller.refresh(provider))), 8_000)
+          let accounts: Account[] | undefined
+          try { accounts = await host.listAccounts() } catch { accounts = undefined }
+          const report = buildReport(config, controller.state, { now: Date.now(), accounts, live: true })
+          return { text: formatReport(report), report }
+        },
       }))
     } catch (error) {
       await Promise.all(registrations.map(registration => registration.dispose()))
