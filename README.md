@@ -59,23 +59,27 @@ The wizard walks you through:
 
 Nothing is written until you confirm the summary. Cancel at any point and no files change.
 
-**3. Use OpenCode normally.** Check the router any time with `/router-status` (or `/router`, or *Router: account status* in the command palette). It opens a dialog like this:
+**3. Use OpenCode normally.** Check the router any time with `/router-status` (or `/router`, or *Router: account status* in the command palette). It opens a dialog in your theme's colours (Esc closes it):
 
 ```text
-Anthropic · paid fallback off
-● Claude Personal  [ACTIVE]
-    5-hour  ████████░░░░░░ 57%  used · resets in 2h 14m
-    Weekly  ███░░░░░░░░░░░ 19%  used · resets in 5d 18h
-    checked just now
-○ Claude Team  [standby]
-    5-hour  ░░░░░░░░░░░░░░ 0%   used · not started
-    Weekly  ███░░░░░░░░░░░ 22%  used · resets in 4d 21h
-    checked just now
+Zenox Account Router  ·  live                                  esc
 
-Usage refreshes every 10m while you're active.
+ANTHROPIC   paid fallback off
+  ● Claude Personal                      ACTIVE
+      5-hour  ███████████████░░░░░   76%  resets in 2h 14m
+      Weekly  ████████░░░░░░░░░░░░   41%  resets in 4d 0h
+      checked just now
+  ○ Claude Team                          standby
+      5-hour  ░░░░░░░░░░░░░░░░░░░░    0%  not started
+      Weekly  ███████████████████░   93%  resets in 2d 0h
+      checked just now
+  → If the current account runs out: Claude Team
+
+Usage is checked every 10m while OpenCode is active.
+The router switches accounts only when one runs out.
 ```
 
-Accounts that hit their limit show `cooling down` with the time left; a paid key shows as `paid API key`.
+Bars turn yellow from 70% and red from 90%. An account that hit its limit shows `limit hit · back in 3h 12m`; a paid key shows `paid API key · last resort`.
 
 ## How it decides
 
@@ -102,13 +106,13 @@ If you manually pick an account that isn't in your selection, the router steps a
 
 ```sh
 npx zenox-account-router setup              # interactive onboarding
-npx zenox-account-router accounts           # list accounts saved in OpenCode (no secrets)
-npx zenox-account-router status             # saved usage and router state (offline)
-npx zenox-account-router status --refresh   # fetch live usage now (respects polling limits)
-npx zenox-account-router dry-run --refresh  # which account would be chosen (never activates)
+npx zenox-account-router accounts           # accounts saved in OpenCode, grouped by provider (no secrets)
+npx zenox-account-router status             # usage bars from the last check, plus the active account
+npx zenox-account-router status --refresh   # check usage live now (at most once a minute per account)
+npx zenox-account-router dry-run            # which account the router would use, why, and what comes next
 ```
 
-All commands accept `--json`, `--config <path>`, and `--server <url>`. Inside OpenCode, `/router-status` shows the live view.
+All commands accept `--json`, `--config <path>`, and `--server <url>`. Output is coloured in a terminal; set `NO_COLOR=1` to turn that off. `--json` output is never coloured and never contacts OpenCode or the providers unless you add `--refresh`. Inside OpenCode, `/router-status` shows the live view.
 
 ## Configuration
 

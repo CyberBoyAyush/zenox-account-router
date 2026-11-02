@@ -1,4 +1,5 @@
 import { cleanLabel } from './display.js'
+import { chooseInitial } from './policy.js'
 import { PROVIDERS } from './types.js'
 import type { Account, ProviderID, RouterConfig, RouterState, UsageWindow } from './types.js'
 
@@ -14,6 +15,7 @@ export interface ReportAccount {
   method: 'oauth' | 'key'
   active: boolean
   sticky: boolean
+  favorite: boolean
   needsAuth: boolean
   cooldownUntil?: number
   usage?: { status: string; checkedAt: number; windows: ReportWindow[] }
@@ -24,6 +26,8 @@ export interface ReportProvider {
   paidFallback: boolean
   /** Set when the active account is outside the selection, so routing is paused. */
   pausedBy?: string
+  /** Where the router would go if the current account ran out; `null` means it would stop. */
+  next: { label: string; paid: boolean } | null
   accounts: ReportAccount[]
 }
 
@@ -31,10 +35,12 @@ export interface StatusReport {
   generatedAt: number
   pollIntervalMs: number
   live: boolean
+  /** True when the OpenCode account list was read, so `active` reflects OpenCode itself. */
+  liveAccounts: boolean
   providers: ReportProvider[]
 }
 
-const NAMES: Record<ProviderID, string> = { anthropic: 'Anthropic', openai: 'OpenAI' }
+export const PROVIDER_NAMES: Record<ProviderID, string> = { anthropic: 'Anthropic', openai: 'OpenAI' }
 
 function windows(values: UsageWindow[]): ReportWindow[] {
   // Always show the core 5-hour/weekly windows; extra (model/app) windows only once they carry data.
@@ -63,17 +69,27 @@ export function buildReport(config: RouterConfig, state: RouterState, options: {
         method: id === settings.apiKeyAccountID && !settings.accountIDs.includes(id) ? 'key' : 'oauth',
         active: active?.id === id,
         sticky: state.sticky[provider] === id,
+        favorite: settings.favoriteAccountID === id,
         needsAuth: account?.needsAuth === true || (listed !== undefined && !account),
         ...(cooldown && cooldown.until > options.now ? { cooldownUntil: cooldown.until } : {}),
         ...(usage ? { usage: { status: usage.status, checkedAt: usage.checkedAt, windows: windows(usage.windows) } } : {}),
       }
     })
+    const current = listed ? active?.id : state.sticky[provider]
+    const alternatives = accounts
+      .filter(account => account.method === 'oauth' && account.id !== current && !account.needsAuth && !account.cooldownUntil)
+      .map((account): Account => ({ id: account.id, provider, label: account.label, method: 'oauth', active: false }))
+    const choice = chooseInitial(settings, alternatives, Object.values(state.usage), options.now).accountID
+    // Mirrors the controller: the key is only used once every selected subscription is signed in and exhausted.
+    const key = accounts.find(account => account.method === 'key')
+    const keyUsable = !!key && key.id !== current && !key.needsAuth && !key.cooldownUntil && accounts.every(account => account.method === 'key' || !account.needsAuth)
     providers.push({
       provider, paidFallback: settings.allowPaidFallback, accounts,
+      next: choice ? { label: label(choice), paid: false } : keyUsable ? { label: key.label, paid: true } : null,
       ...(active && !ids.includes(active.id) ? { pausedBy: cleanLabel(active.label) } : {}),
     })
   }
-  return { generatedAt: options.now, pollIntervalMs: config.pollIntervalMs, live: options.live, providers }
+  return { generatedAt: options.now, pollIntervalMs: config.pollIntervalMs, live: options.live, liveAccounts: options.accounts !== undefined, providers }
 }
 
 export function duration(milliseconds: number): string {
@@ -91,51 +107,148 @@ function ago(milliseconds: number): string {
   return value === 'now' ? 'just now' : `${value} ago`
 }
 
-function bar(percent: number, width = 14): string {
-  const filled = Math.round((Math.min(100, Math.max(0, percent)) / 100) * width)
-  return '█'.repeat(filled) + '░'.repeat(width - filled)
+/** Semantic colour roles; the CLI maps them to ANSI and the OpenCode dialog to theme colours. */
+export type Tone = 'text' | 'strong' | 'muted' | 'faint' | 'accent' | 'good' | 'warn' | 'bad'
+export interface Segment { text: string; tone?: Tone }
+export type Line = Segment[]
+
+export const BAR_WIDTH = 20
+const LABEL_WIDTH = 36
+
+export function usageTone(percent: number): Tone {
+  return percent >= 90 ? 'bad' : percent >= 70 ? 'warn' : 'good'
 }
 
-function pad(value: string, width: number): string {
-  return value.length >= width ? value.slice(0, width) : value + ' '.repeat(width - value.length)
+const graphemes = new Intl.Segmenter(undefined, { granularity: 'grapheme' })
+const WIDE = /\p{Extended_Pictographic}|[\u1100-\u115F\u2E80-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6\u{20000}-\u{3FFFD}]/u
+
+/** Terminal columns: CJK and emoji take two, combining sequences one. */
+export function displayWidth(value: string): number {
+  let width = 0
+  for (const { segment } of graphemes.segment(value)) width += WIDE.test(segment) ? 2 : 1
+  return width
 }
 
-/** Plain-text rendering shared by the OpenCode dialog and the CLI. */
-export function formatReport(report: StatusReport): string {
-  if (!report.providers.length) return 'No providers are configured. Run `npx zenox-account-router setup`.'
+/** Pads or truncates (with …) to exactly `width` columns without splitting characters. */
+export function fit(value: string, width: number): string {
+  if (displayWidth(value) <= width) return value + ' '.repeat(width - displayWidth(value))
+  let out = ''
+  let used = 0
+  for (const { segment } of graphemes.segment(value)) {
+    const size = WIDE.test(segment) ? 2 : 1
+    if (used + size > width - 1) break
+    out += segment
+    used += size
+  }
+  return `${out}…${' '.repeat(width - 1 - used)}`
+}
+
+function joinTags(tags: Segment[]): Line {
+  return tags.flatMap((tag, index) => (index ? [{ text: ' · ', tone: 'faint' as const }, tag] : [tag]))
+}
+
+/**
+ * Lays the report out as styled lines (≤ 80 columns). `title` adds a heading for standalone output;
+ * `cli` adds hints that only make sense on the command line.
+ */
+export function layoutReport(report: StatusReport, options: { title?: boolean; cli?: boolean } = {}): Line[] {
+  const lines: Line[] = []
   const now = report.generatedAt
-  const lines: string[] = []
-  for (const provider of report.providers) {
-    if (lines.length) lines.push('')
-    lines.push(`${NAMES[provider.provider]} · paid fallback ${provider.paidFallback ? 'ON' : 'off'}`)
-    if (provider.pausedBy) lines.push(`  Routing paused: active account "${provider.pausedBy}" is not in your selection.`)
+  if (options.title) {
+    lines.push([{ text: 'Zenox Account Router', tone: 'strong' }, { text: report.live ? '  ·  live' : '  ·  saved snapshot', tone: 'muted' }])
+    lines.push([])
+  }
+  if (!report.providers.length) {
+    lines.push([{ text: 'No providers are configured yet. Run ', tone: 'text' }, { text: 'npx zenox-account-router setup', tone: 'accent' }, { text: '.', tone: 'text' }])
+    return lines
+  }
+  const labelWidth = Math.max(6, ...report.providers.flatMap(provider => provider.accounts.flatMap(account => account.usage?.windows.map(window => window.label.length) ?? [])))
+  for (const [index, provider] of report.providers.entries()) {
+    if (index) lines.push([])
+    lines.push([
+      { text: PROVIDER_NAMES[provider.provider].toUpperCase(), tone: 'accent' },
+      { text: '   paid fallback ', tone: 'muted' },
+      { text: provider.paidFallback ? 'ON' : 'off', tone: provider.paidFallback ? 'warn' : 'muted' },
+    ])
+    if (provider.pausedBy) lines.push([{ text: `  ! Paused: "${fit(provider.pausedBy, 30).trimEnd()}" is active but not selected.`, tone: 'warn' }])
     for (const account of provider.accounts) {
-      const tags = [
-        account.active ? 'ACTIVE' : undefined,
-        account.sticky && !account.active ? 'sticky' : undefined,
-        account.cooldownUntil ? `cooling down ${duration(account.cooldownUntil - now)}` : undefined,
-        account.needsAuth ? 'needs sign-in' : undefined,
-        account.method === 'key' ? 'paid API key' : undefined,
-      ].filter((tag): tag is string => !!tag)
-      lines.push(`${account.active ? '●' : '○'} ${account.label}${tags.length ? `  [${tags.join(' · ')}]` : account.method === 'oauth' ? '  [standby]' : ''}`)
+      // Without OpenCode's live list, the account the router last activated is the best guess at "in use".
+      const inUse = report.liveAccounts ? account.active : account.sticky
+      const tags: Segment[] = []
+      if (inUse) tags.push({ text: report.liveAccounts ? 'ACTIVE' : 'IN USE', tone: 'good' })
+      if (account.cooldownUntil) tags.push({ text: `limit hit · back in ${duration(account.cooldownUntil - now)}`, tone: 'warn' })
+      if (account.needsAuth) tags.push({ text: 'needs sign-in', tone: 'bad' })
+      if (account.method === 'key') tags.push({ text: 'paid API key · last resort', tone: 'warn' })
+      if (!tags.length) tags.push({ text: 'standby', tone: 'muted' })
+      if (account.favorite) tags.push({ text: '★ favorite', tone: 'muted' })
+      // Tags that would push the line past 80 columns continue on an indented line.
+      const room = 80 - (LABEL_WIDTH + 5)
+      let used = 0
+      const overflow = tags.findIndex((tag, index) => (used += displayWidth(tag.text) + (index ? 3 : 0)) > room)
+      const split = overflow === -1 ? -1 : Math.max(1, overflow)
+      const first = split > 0 ? tags.slice(0, split) : tags
+      lines.push([
+        { text: '  ' },
+        { text: inUse ? '●' : '○', tone: inUse ? 'good' : 'faint' },
+        { text: ` ${fit(account.label, LABEL_WIDTH)} `, tone: inUse ? 'strong' : 'text' },
+        ...joinTags(first),
+      ])
+      if (split > 0) lines.push([{ text: '      ' }, ...joinTags(tags.slice(split))])
       if (account.method === 'key') continue
       const usage = account.usage
-      if (!usage) { lines.push('    usage not checked yet'); continue }
+      if (!usage) { lines.push([{ text: '      usage not checked yet', tone: 'faint' }]); continue }
       if (usage.status !== 'ok') {
-        const reason: Record<string, string> = { expired: 'token expired (refreshed when needed)', 'needs-auth': 'needs sign-in', 'rate-limited': 'usage check rate-limited', unavailable: 'usage unavailable', unsupported: 'not applicable' }
-        lines.push(`    ${reason[usage.status] ?? usage.status} · checked ${ago(now - usage.checkedAt)}`)
+        const reason: Record<string, [string, Tone]> = {
+          expired: ['sign-in token expired · OpenCode refreshes it when this account is used', 'muted'],
+          'needs-auth': ['needs sign-in · run /connect in OpenCode', 'bad'],
+          'rate-limited': ['usage check rate-limited · will retry', 'warn'],
+          unavailable: ['usage unavailable right now', 'warn'],
+          unsupported: ['usage not reported for this account', 'muted'],
+        }
+        const [text, tone] = reason[usage.status] ?? [usage.status, 'muted']
+        lines.push([{ text: `      ${text}`, tone }, { text: ` · ${ago(now - usage.checkedAt)}`, tone: 'faint' }])
         continue
       }
-      const labelWidth = Math.max(8, ...usage.windows.map(window => window.label.length))
       for (const window of usage.windows) {
         const percent = window.usedPercent
-        const reset = window.resetsAt === null ? (percent === null || percent === 0 ? 'not started' : 'no reset reported') : window.resetsAt <= now ? 'resetting' : `resets in ${duration(window.resetsAt - now)}`
-        lines.push(`    ${pad(window.label, labelWidth)} ${percent === null ? pad('unknown', 14) : bar(percent)} ${percent === null ? '' : `${pad(`${Math.round(percent)}%`, 4)} used · `}${reset}`)
+        const reset = window.resetsAt === null ? (percent === null || percent === 0 ? 'not started' : 'no reset time') : window.resetsAt <= now ? 'reset since this check' : `resets in ${duration(window.resetsAt - now)}`
+        if (percent === null) {
+          lines.push([{ text: `      ${window.label.padEnd(labelWidth)}  `, tone: 'muted' }, { text: '·'.repeat(BAR_WIDTH), tone: 'faint' }, { text: '     ?  ', tone: 'faint' }, { text: reset, tone: 'faint' }])
+          continue
+        }
+        const clamped = Math.min(100, Math.max(0, percent))
+        const filled = Math.round((clamped / 100) * BAR_WIDTH)
+        const tone = usageTone(clamped)
+        lines.push([
+          { text: `      ${window.label.padEnd(labelWidth)}  `, tone: 'muted' },
+          { text: '█'.repeat(filled), tone },
+          { text: '░'.repeat(BAR_WIDTH - filled), tone: 'faint' },
+          { text: `  ${`${Math.round(clamped)}%`.padStart(4)}  `, tone },
+          { text: reset, tone: 'muted' },
+        ])
       }
-      lines.push(`    checked ${ago(now - usage.checkedAt)}`)
+      lines.push([{ text: `      checked ${ago(now - usage.checkedAt)}`, tone: 'faint' }])
+    }
+    if (provider.accounts.filter(account => account.method === 'oauth').length > 1 || provider.next?.paid) {
+      lines.push([
+        { text: '  → If the current account runs out: ', tone: 'muted' },
+        provider.next ? { text: provider.next.paid ? `${fit(provider.next.label, 20).trimEnd()} (paid, allowed models)` : fit(provider.next.label, 42).trimEnd(), tone: provider.next.paid ? 'warn' : 'text' } : { text: 'nothing left, requests stop', tone: 'bad' },
+      ])
     }
   }
-  lines.push('')
-  lines.push(`Usage refreshes every ${duration(report.pollIntervalMs)} while you're active. ${report.live ? '' : 'Saved snapshot; use --refresh for live data.'}`.trim())
-  return lines.join('\n')
+  lines.push([])
+  lines.push([{ text: `Usage is checked every ${duration(report.pollIntervalMs)} while OpenCode is active.`, tone: 'faint' }])
+  lines.push([{ text: 'The router switches accounts only when one runs out.', tone: 'faint' }])
+  if (options.cli && !report.live) lines.push([{ text: 'Saved snapshot. Add --refresh for live numbers.', tone: 'faint' }])
+  return lines
+}
+
+/** Renders laid-out lines; `paint` styles one segment (identity for plain text). */
+export function renderLines(lines: Line[], paint: (segment: Segment) => string = segment => segment.text): string {
+  return lines.map(line => line.map(paint).join('').trimEnd()).join('\n')
+}
+
+/** Plain-text rendering, used by the dialog fallback and plain CLI output. */
+export function formatReport(report: StatusReport, options?: { title?: boolean; cli?: boolean }): string {
+  return renderLines(layoutReport(report, options))
 }

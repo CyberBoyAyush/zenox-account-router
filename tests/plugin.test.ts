@@ -320,12 +320,13 @@ describe('real Plugin.define account-router setup', () => {
     const offline = await f.rpc.status!({}) as { text: string; report: { providers: { accounts: { id: string; active: boolean }[] }[] } }
     expect(monitor).not.toHaveBeenCalled()
     expect(offline.report.providers[0]!.accounts.map(account => [account.id, account.active])).toEqual([['a', true], ['b', false]])
-    expect(offline.text).toContain('Anthropic · paid fallback off')
-    expect(offline.text).toContain('● Synthetic a  [ACTIVE]')
+    expect(offline.text).toContain('ANTHROPIC   paid fallback off')
+    expect(offline.text).toMatch(/● Synthetic a\s+ACTIVE\n/)
+    expect(offline.text).toContain('→ If the current account runs out: Synthetic b')
     expect(offline.text).toContain('usage not checked yet')
     const live = await f.rpc.status!({ refresh: true }) as { text: string }
     expect(monitor).toHaveBeenCalledTimes(2)
-    expect(live.text).toMatch(/5-hour\s+█+░+ 20%\s+used · resets in 5h 0m/)
+    expect(live.text).toMatch(/5-hour\s+█+░+\s+20%\s+resets in 5h 0m/)
     expect(live.text).not.toMatch(/synthetic-anthropic-[ab]\b|synthetic-refresh/)
     expect(f.synthetic).not.toHaveBeenCalled()
     expect(f.sessionGet).not.toHaveBeenCalled()

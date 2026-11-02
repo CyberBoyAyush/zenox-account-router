@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { createCredentialSource, parseAccounts, parseCredentials } from '../src/opencode.js'
+import type { CommandRunner } from '../src/opencode.js'
 import { cleanLabel } from '../src/display.js'
 
 const account = { id: 'a1', integrationID: 'anthropic', label: 'Personal', active: true, type: 'oauth' }
@@ -101,9 +102,9 @@ describe('private OpenCode credential access', () => {
     await source.listAccounts()
     await source.readCredentials('anthropic')
     expect(run.mock.calls).toEqual([
-      ['/safe path/opencode', ['--version']],
-      ['/safe path/opencode', ['auth', 'list', '--format', 'json', '--server', 'http://localhost:4096']],
-      ['/safe path/opencode', ['auth', 'export', 'anthropic', '--server', 'http://localhost:4096']],
+      ['/safe path/opencode', ['--version'], undefined],
+      ['/safe path/opencode', ['auth', 'list', '--format', 'json', '--server', 'http://localhost:4096'], undefined],
+      ['/safe path/opencode', ['auth', 'export', 'anthropic', '--server', 'http://localhost:4096'], undefined],
     ])
   })
 
@@ -112,6 +113,19 @@ describe('private OpenCode credential access', () => {
     const source = createCredentialSource({ runCommand: run })
     await expect(source.listAccounts()).rejects.toThrow('OpenCode 2.2.5 or newer V2 is required.')
     expect(run).toHaveBeenCalledTimes(1)
+  })
+
+  it('passes a per-call timeout to every command and retries a version check that failed', async () => {
+    let fail = true
+    const run = vi.fn<CommandRunner>(async (_executable, args) => {
+      if (args[0] === '--version') { if (fail) throw new Error('timed out'); return '\u001b[1mopencode\u001b[0m \u001b[2mv\u001b[0m2.2.5' }
+      return '[]'
+    })
+    const source = createCredentialSource({ runCommand: run })
+    await expect(source.listAccounts({ timeoutMs: 5_000 })).rejects.toThrow('Unable to check OpenCode version.')
+    fail = false
+    expect(await source.listAccounts({ timeoutMs: 5_000 })).toEqual([])
+    expect(run.mock.calls.map(call => call[2])).toEqual([5_000, 5_000, 5_000])
   })
 
   it.each(['2.2.5', '2.2.6', '2.3.0'])('accepts compatible V2 version %s', async version => {

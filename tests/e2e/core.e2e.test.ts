@@ -43,8 +43,8 @@ describe.each(providers)('%s through real OpenCode core', provider => {
     // The status RPC behind /router-status, called through real OpenCode routing.
     const status = await harness.sdk.rpc(RouterRpc).status({}, { location: harness.location }) as { text: string; report: { providers: { accounts: { id: string; active: boolean }[] }[] } }
     expect(status.report.providers[0]!.accounts.map(account => [account.id, account.active])).toEqual([['cred_a', true], ['cred_b', false]])
-    expect(status.text).toContain('● Synthetic cred_a  [ACTIVE]')
-    expect(status.text).toMatch(/Weekly\s+█+░+ 10%\s+used/)
+    expect(status.text).toMatch(/● Synthetic cred_a\s+ACTIVE\n/)
+    expect(status.text).toMatch(/Weekly\s+█+░+\s+10%\s+resets in/)
     expect(status.text).not.toMatch(/access-|refresh-/)
   }, 60_000)
 

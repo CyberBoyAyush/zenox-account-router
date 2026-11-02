@@ -10,13 +10,15 @@ export function usageBlocks(usage: UsageSnapshot | undefined, now: number, maxAg
   return usage.windows.some(window => !window.model && window.usedPercent === 100 && window.resetsAt !== null && window.resetsAt > now)
 }
 
-export function chooseInitial(config: ProviderConfig, accounts: Account[], usage: UsageSnapshot[], now: number): { accountID?: string; reason: string } {
+export type ChoiceKind = 'sticky' | 'favorite' | 'best' | 'none'
+
+export function chooseInitial(config: ProviderConfig, accounts: Account[], usage: UsageSnapshot[], now: number): { accountID?: string; reason: string; kind: ChoiceKind } {
   const selected = accounts.filter(account => account.method === 'oauth' && config.accountIDs.includes(account.id) && !account.needsAuth)
   const active = selected.find(account => account.active)
-  if (active) return { accountID: active.id, reason: 'Keep the active selected account sticky; monitoring alone never switches it.' }
+  if (active) return { accountID: active.id, kind: 'sticky', reason: 'Keep the active selected account sticky; monitoring alone never switches it.' }
   const eligible = selected.filter(account => !usageBlocks(usage.find(value => value.accountID === account.id && value.provider === account.provider), now))
   const favorite = eligible.find(account => account.id === config.favoriteAccountID)
-  if (favorite) return { accountID: favorite.id, reason: 'Use the selected favorite for initial selection.' }
+  if (favorite) return { accountID: favorite.id, kind: 'favorite', reason: 'Use the selected favorite for initial selection.' }
   const score = (account: Account): number[] => {
     const item = usage.find(value => value.accountID === account.id && value.provider === account.provider)
     if (!freshUsage(item, now)) return [0, 0, 0]
@@ -29,5 +31,5 @@ export function chooseInitial(config: ProviderConfig, accounts: Account[], usage
     for (let index = 0; index < a.length; index++) if (a[index] !== b[index]) return b[index]! - a[index]!
     return config.accountIDs.indexOf(left.id) - config.accountIDs.indexOf(right.id)
   })
-  return eligible[0] ? { accountID: eligible[0].id, reason: 'Prefer a running window, then remaining weekly allowance; keep this choice sticky.' } : { reason: 'No eligible selected subscription; initial selection never authorizes paid fallback.' }
+  return eligible[0] ? { accountID: eligible[0].id, kind: 'best', reason: 'Prefer a running window, then remaining weekly allowance; keep this choice sticky.' } : { kind: 'none', reason: 'No eligible selected subscription; initial selection never authorizes paid fallback.' }
 }

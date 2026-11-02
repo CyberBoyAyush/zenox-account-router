@@ -1,11 +1,15 @@
 import { execFile } from 'node:child_process'
+import { stripVTControlCharacters } from 'node:util'
 import { cleanLabel } from './display.js'
 import type { Account, CredentialSource, ProviderID, StoredCredential } from './types.js'
 
-export type CommandRunner = (executable: string, args: readonly string[]) => Promise<string>
+export type CommandRunner = (executable: string, args: readonly string[], timeoutMs?: number) => Promise<string>
 
-export const runCommand: CommandRunner = (executable, args) => new Promise((resolve, reject) => {
-  execFile(executable, [...args], { encoding: 'utf8', timeout: 15_000, maxBuffer: 2 * 1024 * 1024, windowsHide: true, shell: false }, (error, stdout) => {
+export const runCommand: CommandRunner = (executable, args, timeoutMs = 15_000) => new Promise((resolve, reject) => {
+  // Machine-readable output only: a forced-colour environment would otherwise style `--version`.
+  const env: NodeJS.ProcessEnv = { ...process.env, NO_COLOR: '1' }
+  delete env.FORCE_COLOR
+  execFile(executable, [...args], { encoding: 'utf8', env, timeout: timeoutMs, killSignal: 'SIGKILL', maxBuffer: 2 * 1024 * 1024, windowsHide: true, shell: false }, (error, stdout) => {
     if (error) reject(new Error('OpenCode command failed. Check installation, server connection, and sign-in.'))
     else resolve(stdout)
   })
@@ -107,18 +111,18 @@ export function createCredentialSource(options: { server?: string; executable?: 
   }
   const serverArgs = options.server ? ['--server', options.server] : []
   let checked: Promise<void> | undefined
-  const check = (): Promise<void> => checked ??= (async () => {
+  const check = (timeoutMs?: number): Promise<void> => checked ??= (async () => {
     let version: string
-    try { version = await execute(executable, ['--version']) } catch { throw new Error('Unable to check OpenCode version. OpenCode 2.2.5 or newer V2 is required.') }
-    const match = /(?:^|\s)v?(\d+)\.(\d+)\.(\d+)(?:\s|$)/u.exec(version.trim())
+    try { version = await execute(executable, ['--version'], timeoutMs) } catch { throw new Error('Unable to check OpenCode version. OpenCode 2.2.5 or newer V2 is required.') }
+    const match = /(?:^|\s)v?(\d+)\.(\d+)\.(\d+)(?:\s|$)/u.exec(stripVTControlCharacters(version).trim())
     if (!match || Number(match[1]) !== 2 || Number(match[2]) < 2 || (Number(match[2]) === 2 && Number(match[3]) < 5)) throw new Error('OpenCode 2.2.5 or newer V2 is required.')
-  })()
-  const read = async (args: string[]): Promise<unknown> => {
-    await check()
-    try { return JSON.parse(await execute(executable, [...args, ...serverArgs])) as unknown } catch { throw new Error('Unable to read OpenCode accounts. Check server connection and sign-in.') }
+  })().catch((error: unknown) => { checked = undefined; throw error })
+  const read = async (args: string[], timeoutMs?: number): Promise<unknown> => {
+    await check(timeoutMs)
+    try { return JSON.parse(await execute(executable, [...args, ...serverArgs], timeoutMs)) as unknown } catch { throw new Error('Unable to read OpenCode accounts. Check server connection and sign-in.') }
   }
   return {
-    async listAccounts() { return parseAccounts(await read(['auth', 'list', '--format', 'json'])) },
+    async listAccounts(options) { return parseAccounts(await read(['auth', 'list', '--format', 'json'], options?.timeoutMs)) },
     async readCredentials(provider) {
       if (provider !== 'anthropic' && provider !== 'openai') throw new Error('Unsupported credential provider.')
       return parseCredentials(await read(['auth', 'export', provider]), provider)

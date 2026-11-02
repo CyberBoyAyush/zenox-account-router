@@ -3,12 +3,14 @@ import { resolve } from 'node:path'
 import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { defaultConfigPath, defaultStatePath, loadConfig, readState, saveState } from './config.js'
-import { cleanLabel, displayAccounts } from './display.js'
-import { buildReport, formatReport } from './report.js'
+import { cleanLabel } from './display.js'
+import { buildReport, fit, layoutReport, PROVIDER_NAMES, renderLines } from './report.js'
+import type { Line } from './report.js'
 import { createCredentialSource } from './opencode.js'
 import { runSetup } from './setup.js'
+import { ansiPaint, colorEnabled } from './style.js'
 import { PROVIDERS } from './types.js'
-import type { Account, CredentialSource, ProviderConfig, RouterState, UsageSnapshot } from './types.js'
+import type { Account, CredentialSource, ProviderConfig, ProviderID, RouterState, UsageSnapshot } from './types.js'
 
 interface CLIArguments {
   command: 'setup' | 'accounts' | 'status' | 'dry-run' | 'help'
@@ -44,9 +46,9 @@ export function parseCLIArguments(args: string[]): CLIArguments {
   return options
 }
 
-type InitialChoice = (config: ProviderConfig, accounts: Account[], usage: UsageSnapshot[], now: number) => { accountID?: string; reason: string }
+type InitialChoice = (config: ProviderConfig, accounts: Account[], usage: UsageSnapshot[], now: number) => { accountID?: string; reason: string; kind?: string }
 
-export async function runCLI(args = process.argv.slice(2), dependencies: { source?: CredentialSource; output?: (text: string) => void; now?: () => number; fetch?: typeof globalThis.fetch; chooseInitial?: InitialChoice } = {}): Promise<void> {
+export async function runCLI(args = process.argv.slice(2), dependencies: { source?: CredentialSource; output?: (text: string) => void; now?: () => number; fetch?: typeof globalThis.fetch; chooseInitial?: InitialChoice; color?: boolean } = {}): Promise<void> {
   const options = parseCLIArguments(args)
   const output = dependencies.output ?? console.log
   if (options.command === 'help') {
@@ -58,9 +60,11 @@ export async function runCLI(args = process.argv.slice(2), dependencies: { sourc
     await runSetup({ configPath: options.config, pluginSpec: options.plugin, server: options.server, source })
     return
   }
+  const color = dependencies.color ?? colorEnabled()
+  const render = (lines: Line[]): string => renderLines(lines, color ? ansiPaint : undefined)
   if (options.command === 'accounts') {
     const accounts = await source.listAccounts()
-    output(options.json ? JSON.stringify(accounts.map(account => ({ id: account.id, provider: account.provider, label: cleanLabel(account.label), method: account.method, active: account.active, needsAuth: account.needsAuth === true })), null, 2) : displayAccounts(accounts))
+    output(options.json ? JSON.stringify(accounts.map(account => ({ id: account.id, provider: account.provider, label: cleanLabel(account.label), method: account.method, active: account.active, needsAuth: account.needsAuth === true })), null, 2) : render(accountLines(accounts)))
     return
   }
   const configPath = options.config ?? defaultConfigPath()
@@ -70,8 +74,10 @@ export async function runCLI(args = process.argv.slice(2), dependencies: { sourc
   if (resolve(configPath) === resolve(statePath)) throw new Error('Router configuration and state paths must differ.')
   const state = await readState(statePath)
   const now = (dependencies.now ?? Date.now)()
+  const notes: Line[] = []
   if (options.refresh) {
     const { adapters } = await import('./providers/index.js')
+    let checked = 0, recent = 0
     for (const provider of PROVIDERS) {
       const settings = config.providers[provider]
       if (!settings) continue
@@ -79,15 +85,20 @@ export async function runCLI(args = process.argv.slice(2), dependencies: { sourc
       for (const credential of credentials) {
         if (credential.method !== 'oauth' || !settings.accountIDs.includes(credential.id)) continue
         const previous = state.usage[`${provider}:${credential.id}`]
-        if (previous && (now - previous.checkedAt < config.pollIntervalMs || (previous.retryAt ?? 0) > now)) continue
+        // An explicit refresh skips the polling interval but never hammers the usage endpoints or ignores backoff.
+        if (previous && (now - previous.checkedAt < MIN_REFRESH_MS || (previous.retryAt ?? 0) > now)) { recent++; continue }
         const usage = await adapters[provider].readUsage(credential, { now, fetch: dependencies.fetch ?? globalThis.fetch, signal: AbortSignal.timeout(15_000) })
         state.usage[`${provider}:${credential.id}`] = usage
+        checked++
       }
     }
     await saveState(state, statePath)
+    notes.push([{ text: `Refreshed ${checked} account${checked === 1 ? '' : 's'}${recent ? `; ${recent} checked under a minute ago or backing off` : ''}. No account was switched.`, tone: 'faint' }])
   }
+  // Human output asks OpenCode which account is really active (local, no secrets); JSON stays fully offline.
+  const live = options.json ? undefined : await liveAccounts(source)
   if (options.command === 'status') {
-    output(options.json ? JSON.stringify({ config, state, refreshed: options.refresh }, null, 2) : formatReport(buildReport(config, state, { now, live: options.refresh })))
+    output(options.json ? JSON.stringify({ config, state, refreshed: options.refresh }, null, 2) : render([...layoutReport(buildReport(config, state, { now, accounts: live, live: options.refresh }), { title: true, cli: true }), ...notes]))
     return
   }
   let chooseInitial = dependencies.chooseInitial
@@ -97,16 +108,74 @@ export async function runCLI(args = process.argv.slice(2), dependencies: { sourc
     if (!policy || typeof policy !== 'object' || !('chooseInitial' in policy) || typeof policy.chooseInitial !== 'function') throw new Error('Routing policy is unavailable.')
     chooseInitial = policy.chooseInitial as InitialChoice
   }
-  const choices: { provider: string; accountID?: string; reason: string }[] = []
+  const choices: { provider: ProviderID; accountID?: string; reason: string; kind?: string }[] = []
   for (const provider of PROVIDERS) {
     const settings = config.providers[provider]
     if (!settings) continue
-    const accounts: Account[] = settings.accountIDs.map(id => ({ id, provider, label: id, method: 'oauth', active: state.sticky[provider] === id }))
+    const current = live ? live.find(account => account.provider === provider && account.active)?.id : state.sticky[provider]
+    const listed = (id: string): Account | undefined => live?.find(account => account.provider === provider && account.id === id)
+    const accounts: Account[] = settings.accountIDs.map(id => ({ id, provider, label: id, method: 'oauth', active: current === id, ...(listed(id)?.needsAuth ? { needsAuth: true } : {}) }))
     if (settings.apiKeyAccountID) accounts.push({ id: settings.apiKeyAccountID, provider, label: settings.apiKeyAccountID, method: 'key', active: false })
     const usage = selectedUsage(state, provider, settings.accountIDs)
-    choices.push({ provider, ...(settings.allowPaidFallback && settings.apiKeyAccountID && state.sticky[provider] === settings.apiKeyAccountID ? { accountID: settings.apiKeyAccountID, reason: 'Keep the saved paid fallback sticky; no automatic return to a subscription.' } : chooseInitial(settings, accounts, usage, now)) })
+    choices.push({ provider, ...(settings.allowPaidFallback && settings.apiKeyAccountID && current === settings.apiKeyAccountID ? { accountID: settings.apiKeyAccountID, kind: 'paid', reason: 'Keep the saved paid fallback sticky; no automatic return to a subscription.' } : chooseInitial(settings, accounts, usage, now)) })
   }
-  output(options.json ? JSON.stringify({ choices, refreshed: options.refresh, activated: false }, null, 2) : choices.map(choice => `${choice.provider}: ${cleanLabel(choice.accountID ?? 'no safe account')} — ${cleanLabel(choice.reason)} (dry run; not activated)`).join('\n'))
+  if (options.json) {
+    output(JSON.stringify({ choices, refreshed: options.refresh, activated: false }, null, 2))
+    return
+  }
+  const report = buildReport(config, state, { now, accounts: live, live: options.refresh })
+  const why: Record<string, string> = {
+    sticky: 'It is in use, so the router stays on it until it runs out.',
+    favorite: 'Nothing is in use yet, so it starts with your favorite.',
+    best: 'Nothing is in use yet, so it picks the one with most room left.',
+    paid: 'The paid key is in use. It stays until you switch back.',
+    none: 'No selected subscription is usable right now.',
+  }
+  const lines: Line[] = [[{ text: 'Zenox Account Router', tone: 'strong' }, { text: '  ·  dry run, nothing is switched', tone: 'muted' }]]
+  for (const choice of choices) {
+    const settings = config.providers[choice.provider]!
+    const provider = report.providers.find(item => item.provider === choice.provider)
+    const label = choice.accountID ? cleanLabel(settings.accountLabels?.[choice.accountID] ?? live?.find(account => account.id === choice.accountID)?.label ?? choice.accountID) : undefined
+    lines.push([], [{ text: PROVIDER_NAMES[choice.provider].toUpperCase(), tone: 'accent' }])
+    lines.push([{ text: '  Uses     ', tone: 'muted' }, label ? { text: fit(label, 60).trimEnd(), tone: 'strong' } : { text: 'no account', tone: 'bad' }])
+    lines.push([{ text: '  Why      ', tone: 'muted' }, { text: why[choice.kind ?? ''] ?? cleanLabel(choice.reason) }])
+    if (provider && choice.kind === 'sticky') {
+      lines.push([{ text: '  Next     ', tone: 'muted' }, provider.next ? { text: provider.next.paid ? `${fit(provider.next.label, 40).trimEnd()} (paid, allowed models)` : fit(provider.next.label, 60).trimEnd(), tone: provider.next.paid ? 'warn' : 'text' } : { text: 'nothing left, requests would stop', tone: 'bad' }])
+    }
+  }
+  if (!options.refresh) lines.push([], [{ text: 'Based on saved usage. Add --refresh for live numbers.', tone: 'faint' }])
+  output(render(lines))
+}
+
+const MIN_REFRESH_MS = 60_000
+
+async function liveAccounts(source: CredentialSource): Promise<Account[] | undefined> {
+  try { return await source.listAccounts({ timeoutMs: 5_000 }) } catch { return undefined }
+}
+
+/** `accounts` command: grouped by provider, IDs on a dimmed second line for copying into config. */
+export function accountLines(accounts: Account[]): Line[] {
+  if (!accounts.length) return [[{ text: 'No Anthropic or OpenAI accounts found. Connect one in OpenCode with /connect first.' }]]
+  const lines: Line[] = []
+  for (const provider of PROVIDERS) {
+    const own = accounts.filter(account => account.provider === provider)
+    if (!own.length) continue
+    if (lines.length) lines.push([])
+    lines.push([{ text: PROVIDER_NAMES[provider].toUpperCase(), tone: 'accent' }])
+    for (const account of own) {
+      const label = cleanLabel(account.label) || '(unnamed)'
+      lines.push([
+        { text: '  ' },
+        { text: account.active ? '●' : '○', tone: account.active ? 'good' : 'faint' },
+        { text: ` ${fit(label, 36)} `, tone: account.active ? 'strong' : 'text' },
+        { text: account.method === 'oauth' ? 'subscription' : 'API key     ', tone: 'muted' },
+        ...(account.active ? [{ text: '  ACTIVE', tone: 'good' as const }] : []),
+        ...(account.needsAuth ? [{ text: '  needs sign-in', tone: 'bad' as const }] : []),
+      ])
+      lines.push([{ text: `    ${cleanLabel(account.id)}`, tone: 'faint' }])
+    }
+  }
+  return lines
 }
 
 function selectedUsage(state: RouterState, provider: string, ids: string[]): UsageSnapshot[] {

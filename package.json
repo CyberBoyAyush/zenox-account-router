@@ -58,13 +58,13 @@
     "access": "public"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && node scripts/build-tui.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "check": "pnpm typecheck && pnpm lint && pnpm test && pnpm build",
-    "prepack": "tsc -p tsconfig.build.json",
+    "prepack": "tsc -p tsconfig.build.json && node scripts/build-tui.mjs",
     "prepublishOnly": "pnpm run check"
   },
   "dependencies": {
@@ -73,24 +73,44 @@
     "zod": "^4.1.8"
   },
   "devDependencies": {
+    "@babel/core": "^7.29.7",
+    "@babel/preset-typescript": "^7.27.1",
     "@eslint/js": "^9.39.0",
     "@ex-machina/opencode-anthropic-auth": "2.0.0-next.6",
     "@opencode/client": "2.2.5",
     "@opencode/plugin": "2.2.5",
     "@opencode/sdk": "2.2.5",
+    "@opencode/theme": "2.2.5",
+    "@opentui/core": "0.8.0",
+    "@opentui/solid": "0.8.0",
+    "@types/babel__core": "^7.20.5",
     "@types/node": "^22.19.0",
     "@vitest/coverage-v8": "^3.2.4",
+    "babel-preset-solid": "^1.9.16",
     "eslint": "^9.39.0",
     "fast-check": "^4.10.2",
+    "solid-js": "^1.9.18",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.46.2",
     "vitest": "^3.2.4"
   },
   "peerDependencies": {
-    "@opencode/plugin": ">=2.2.5 <3"
+    "@opencode/plugin": ">=2.2.5 <3",
+    "@opentui/core": ">=0.8.0",
+    "@opentui/solid": ">=0.8.0",
+    "solid-js": ">=1.9.0"
   },
   "peerDependenciesMeta": {
     "@opencode/plugin": {
+      "optional": true
+    },
+    "@opentui/core": {
+      "optional": true
+    },
+    "@opentui/solid": {
+      "optional": true
+    },
+    "solid-js": {
       "optional": true
     }
   }

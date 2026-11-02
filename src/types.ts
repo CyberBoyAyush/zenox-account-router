@@ -88,7 +88,8 @@ export interface ReadOptions {
 }
 
 export interface CredentialSource {
-  listAccounts(): Promise<Account[]>
+  /** `timeoutMs` bounds (and kills) any OpenCode command the source runs. */
+  listAccounts(options?: { timeoutMs?: number }): Promise<Account[]>
   readCredentials(provider: ProviderID, options?: ReadOptions): Promise<StoredCredential[]>
 }
 

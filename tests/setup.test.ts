@@ -251,12 +251,77 @@ describe('consent-driven onboarding', () => {
     const usage = { provider: 'anthropic' as const, accountID: 'oauth-a', checkedAt: 1234, status: 'ok' as const, windows: [] }
     const readUsage = vi.spyOn(adapters.anthropic, 'readUsage').mockResolvedValue(usage)
     try {
-      await runCLI(['status', '--config', path, '--refresh'], { source: injected, output: vi.fn(), now: () => 1234 })
-      expect(injected.listAccounts).not.toHaveBeenCalled()
+      const output = vi.fn()
+      await runCLI(['status', '--config', path, '--refresh'], { source: injected, output, now: () => 1234, color: false })
+      // Only to show which account OpenCode has active; it returns no secrets.
+      expect(injected.listAccounts).toHaveBeenCalledTimes(1)
       expect(injected.readCredentials).toHaveBeenCalledExactlyOnceWith('anthropic')
       expect(readUsage).toHaveBeenCalledTimes(1)
       expect((await readState(defaultStatePath(path))).usage['anthropic:oauth-a']).toEqual(usage)
       expect(await readFile(defaultStatePath(path), 'utf8')).not.toMatch(/FAKE_ACCESS|FAKE_KEY|UNSELECTED_ACCESS/)
+      expect(output.mock.calls[0]![0]).toContain('Refreshed 1 account. No account was switched.')
+      // An explicit refresh within a minute of the last check, or during backoff, is skipped.
+      await runCLI(['status', '--config', path, '--refresh'], { source: injected, output, now: () => 1234 + 30_000, color: false })
+      expect(readUsage).toHaveBeenCalledTimes(1)
+      expect(output.mock.calls[1]![0]).toContain('Refreshed 0 accounts; 1 checked under a minute ago or backing off.')
+      // Unlike background polling, it does not wait for the full polling interval.
+      await runCLI(['status', '--config', path, '--refresh'], { source: injected, output, now: () => 1234 + 61_000, color: false })
+      expect(readUsage).toHaveBeenCalledTimes(2)
     } finally { readUsage.mockRestore() }
   }))
+
+  it('prints a readable status with the live active account, colour only when enabled, and never IDs or secrets', async () => temporary(async directory => {
+    const path = join(directory, 'router.json')
+    const labelled = configured()
+    labelled.providers.anthropic!.accountLabels = { 'oauth-a': 'Personal', 'oauth-b': 'Work' }
+    await saveConfig(labelled, path)
+    const state = emptyState()
+    state.sticky.anthropic = 'oauth-b'
+    state.usage['anthropic:oauth-a'] = { provider: 'anthropic', accountID: 'oauth-a', checkedAt: 1_000, status: 'ok', windows: [{ id: 'five_hour', label: '5-hour', usedPercent: 95, resetsAt: 1_000 + 3_600_000, durationSeconds: 18_000 }] }
+    await saveState(state, defaultStatePath(path))
+    const output = vi.fn()
+    const injected = source()
+    await runCLI(['status', '--config', path], { source: injected, output, now: () => 61_000, color: false })
+    const plain = output.mock.calls[0]![0] as string
+    expect(plain.split('\n')[0]).toBe('Zenox Account Router  ·  saved snapshot')
+    // OpenCode reports oauth-a as active even though the router last activated oauth-b.
+    expect(plain).toMatch(/● Personal\s+ACTIVE/)
+    expect(plain).toMatch(/5-hour {2}█{19}░ {3}95% {2}resets in 59m/)
+    expect(plain).toContain('Saved snapshot. Add --refresh for live numbers.')
+    expect(plain).not.toMatch(/oauth-[ab]/)
+    expect(plain.includes('\x1b')).toBe(false)
+    expect(injected.readCredentials).not.toHaveBeenCalled()
+    await runCLI(['status', '--config', path], { source: injected, output, now: () => 61_000, color: true })
+    expect(output.mock.calls[1]![0]).toContain('\x1b[31m███████████████████\x1b[0m')
+    // If OpenCode cannot be asked, the router's own record is shown instead.
+    const failing = { ...injected, listAccounts: vi.fn(async () => { throw new Error('offline') }) }
+    await runCLI(['status', '--config', path], { source: failing, output, now: () => 61_000, color: false })
+    expect(output.mock.calls[2]![0]).toMatch(/● Work\s+IN USE/)
+  }))
+
+  it('explains a dry run in words with account names and the next account, without switching', async () => temporary(async directory => {
+    const path = join(directory, 'router.json')
+    await saveConfig(configured(), path)
+    const output = vi.fn()
+    const injected = source()
+    await runCLI(['dry-run', '--config', path], { source: injected, output, now: () => 1234, color: false })
+    const text = output.mock.calls[0]![0] as string
+    expect(text).toContain('Zenox Account Router  ·  dry run, nothing is switched')
+    expect(text).toMatch(/Uses {5}Personal\n/)
+    expect(text).toContain('Why      It is in use, so the router stays on it until it runs out.')
+    expect(text).toMatch(/Next {5}Work\n/)
+    expect(text).not.toMatch(/oauth-[ab]/)
+    expect(injected.readCredentials).not.toHaveBeenCalled()
+  }))
+
+  it('lists accounts grouped by provider with IDs on their own line', async () => {
+    const output = vi.fn()
+    await runCLI(['accounts'], { source: source(), output, color: false })
+    const text = output.mock.calls[0]![0] as string
+    expect(text).toMatch(/^ANTHROPIC\n {2}● Personal\s+subscription {2}ACTIVE\n {4}oauth-a\n/)
+    expect(text).toMatch(/○ API\s+API key\n {4}key-a\n\nOPENAI\n/)
+    expect(text.split('\n').every(line => line.length <= 80)).toBe(true)
+    await runCLI(['accounts'], { source: { listAccounts: async () => [], readCredentials: async () => [] }, output, color: false })
+    expect(output.mock.calls[1]![0]).toContain('/connect')
+  })
 })
