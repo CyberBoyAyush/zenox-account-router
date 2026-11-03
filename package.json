@@ -1,6 +1,6 @@
 {
   "name": "zenox-account-router",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Smart, quota-aware account routing and failover for OpenCode V2 — uses the subscription allowance that expires first, never breaks a warm prompt cache, paid API key last.",
   "keywords": [
     "opencode",
