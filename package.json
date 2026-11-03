@@ -1,7 +1,7 @@
 {
   "name": "zenox-account-router",
-  "version": "0.2.0",
-  "description": "Sticky, quota-aware account failover for OpenCode V2 — Claude and ChatGPT subscriptions first, optional paid API key last.",
+  "version": "0.3.0",
+  "description": "Smart, quota-aware account routing and failover for OpenCode V2 — uses the subscription allowance that expires first, never breaks a warm prompt cache, paid API key last.",
   "keywords": [
     "opencode",
     "opencode-plugin",
