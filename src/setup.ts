@@ -186,6 +186,7 @@ export async function runSetup(options: {
       review.push(`  Paid fallback:  ${settings.allowPaidFallback && settings.apiKeyAccountID ? `ON — ${label(settings.apiKeyAccountID)} for ${settings.apiKeyModels.map(cleanLabel).join(', ')}` : 'off'}`)
     }
     review.push(`Usage checks:     every ${Number(minutes)} minutes while active`)
+    review.push('Routing:          smart (after 5 quiet minutes, use the allowance that expires first; set "strategy": "sticky" to only switch when one runs out)')
     review.push('Credentials:      none stored')
     prompts.note(wrap(review.join('\n')), 'Review')
     if (!await ask(prompts.confirm({ message: 'Save this configuration?', initialValue: false }))) { prompts.outro('Cancelled; no files changed.'); return null }

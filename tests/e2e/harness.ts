@@ -180,7 +180,7 @@ export interface Harness {
 /** Credentials are created in order; the last one created is active, matching OpenCode's "newest becomes active". */
 type RouterInput = Partial<Record<ProviderID, Partial<NonNullable<RouterConfig['providers'][ProviderID]>> & { accountIDs: string[] }>>
 
-export async function start(options: { router: RouterInput; credentials: Partial<Record<ProviderID, Credential[]>>; anthropicAuth?: boolean; routerFirst?: boolean }): Promise<Harness> {
+export async function start(options: { router: RouterInput; credentials: Partial<Record<ProviderID, Credential[]>>; anthropicAuth?: boolean; routerFirst?: boolean; opencodeConfig?: Record<string, unknown> }): Promise<Harness> {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'router-e2e-')))
   roots.add(root)
   // Never let real provider keys from the developer's shell leak into the embedded engine.
@@ -224,7 +224,7 @@ export async function start(options: { router: RouterInput; credentials: Partial
     // The published auth plugin is typed against an older SDK; its runtime contract is the same `{ id, setup }`.
     const auth = options.anthropicAuth === false ? [] : [(await import('@ex-machina/opencode-anthropic-auth')).default as unknown as Plugin.Plugin]
     const plugins: Plugin.Plugin[] = options.routerFirst ? [router, ...auth] : [...auth, router]
-    sdk = await OpenCode.create({ app: { version: '2.2.5' }, plugins, config: { directory: join(root, 'cfg'), project: false, claude: false }, models: { fetch: false }, fs: { filewatcher: false } })
+    sdk = await OpenCode.create({ app: { version: '2.2.5' }, plugins, config: { directory: join(root, 'cfg'), project: false, claude: false, ...(options.opencodeConfig ? { content: JSON.stringify(options.opencodeConfig) } : {}) }, models: { fetch: false }, fs: { filewatcher: false } })
     await sdk.integration.list({ location })
     for (const provider of ['anthropic', 'openai'] as const) {
       for (const credential of options.credentials[provider] ?? []) await sdk.credential.create({ id: credential.id, integrationID: provider, label: credential.label ?? credential.id, value: credential.value, ...(credential.inactive ? { activate: false } : {}) })

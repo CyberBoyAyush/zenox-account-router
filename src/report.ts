@@ -1,7 +1,7 @@
-import { cleanLabel } from './display.js'
-import { chooseInitial } from './policy.js'
+import { cleanLabel, duration } from './display.js'
+import { chooseInitial, DEFAULT_CACHE_WINDOW_MS, planRebalance } from './policy.js'
 import { PROVIDERS } from './types.js'
-import type { Account, ProviderID, RouterConfig, RouterState, UsageWindow } from './types.js'
+import type { Account, ProviderID, RouterConfig, RouterState, RoutingStrategy, UsageWindow } from './types.js'
 
 export interface ReportWindow {
   label: string
@@ -28,12 +28,19 @@ export interface ReportProvider {
   pausedBy?: string
   /** Where the router would go if the current account ran out; `null` means it would stop. */
   next: { label: string; paid: boolean } | null
+  /** Smart routing only: the account the next cache-safe prompt would move to. */
+  better?: { label: string; reason: string }
   accounts: ReportAccount[]
 }
 
 export interface StatusReport {
   generatedAt: number
   pollIntervalMs: number
+  strategy: RoutingStrategy
+  /** Effective prompt-cache window per configured provider. */
+  cacheWindows: Partial<Record<ProviderID, number>>
+  /** Where the decision log is written, when known. */
+  logPath?: string
   live: boolean
   /** True when the OpenCode account list was read, so `active` reflects OpenCode itself. */
   liveAccounts: boolean
@@ -51,7 +58,7 @@ function windows(values: UsageWindow[]): ReportWindow[] {
 }
 
 /** Builds a credential-free status snapshot. `accounts` is the live OpenCode list when available. */
-export function buildReport(config: RouterConfig, state: RouterState, options: { now: number; accounts?: Account[]; live: boolean }): StatusReport {
+export function buildReport(config: RouterConfig, state: RouterState, options: { now: number; accounts?: Account[]; live: boolean; cacheWindows?: Partial<Record<ProviderID, number>>; logPath?: string }): StatusReport {
   const providers: ReportProvider[] = []
   for (const provider of PROVIDERS) {
     const settings = config.providers[provider]
@@ -79,28 +86,27 @@ export function buildReport(config: RouterConfig, state: RouterState, options: {
     const alternatives = accounts
       .filter(account => account.method === 'oauth' && account.id !== current && !account.needsAuth && !account.cooldownUntil)
       .map((account): Account => ({ id: account.id, provider, label: account.label, method: 'oauth', active: false }))
-    const choice = chooseInitial(settings, alternatives, Object.values(state.usage), options.now).accountID
+    const choice = chooseInitial(settings, alternatives, Object.values(state.usage), options.now, config.strategy).accountID
     // Mirrors the controller: the key is only used once every selected subscription is signed in and exhausted.
     const key = accounts.find(account => account.method === 'key')
     const keyUsable = !!key && key.id !== current && !key.needsAuth && !key.cooldownUntil && accounts.every(account => account.method === 'key' || !account.needsAuth)
+    const using = accounts.find(account => account.id === current && account.method === 'oauth' && !account.needsAuth)
+    const plan = config.strategy === 'smart' && using
+      ? planRebalance(settings, { id: using.id, provider, label: using.label, method: 'oauth', active: true }, alternatives, Object.values(state.usage), options.now, { maxAge: config.pollIntervalMs, currentBlocked: !!using.cooldownUntil })
+      : undefined
     providers.push({
       provider, paidFallback: settings.allowPaidFallback, accounts,
       next: choice ? { label: label(choice), paid: false } : keyUsable ? { label: key.label, paid: true } : null,
+      ...(plan?.accountID ? { better: { label: label(plan.accountID), reason: plan.reason } } : {}),
       ...(active && !ids.includes(active.id) ? { pausedBy: cleanLabel(active.label) } : {}),
     })
   }
-  return { generatedAt: options.now, pollIntervalMs: config.pollIntervalMs, live: options.live, liveAccounts: options.accounts !== undefined, providers }
+  const cacheWindows: Partial<Record<ProviderID, number>> = {}
+  for (const { provider } of providers) cacheWindows[provider] = options.cacheWindows?.[provider] ?? config.cacheWindowMs ?? DEFAULT_CACHE_WINDOW_MS[provider]
+  return { generatedAt: options.now, pollIntervalMs: config.pollIntervalMs, strategy: config.strategy, cacheWindows, ...(options.logPath ? { logPath: options.logPath } : {}), live: options.live, liveAccounts: options.accounts !== undefined, providers }
 }
 
-export function duration(milliseconds: number): string {
-  const minutes = Math.max(0, Math.round(milliseconds / 60_000))
-  if (minutes < 1) return 'now'
-  if (minutes < 60) return `${minutes}m`
-  const hours = Math.floor(minutes / 60)
-  if (hours < 24) return `${hours}h ${minutes % 60}m`
-  const days = Math.floor(hours / 24)
-  return `${days}d ${hours % 24}h`
-}
+export { duration }
 
 function ago(milliseconds: number): string {
   const value = duration(milliseconds)
@@ -235,10 +241,21 @@ export function layoutReport(report: StatusReport, options: { title?: boolean; c
         provider.next ? { text: provider.next.paid ? `${fit(provider.next.label, 20).trimEnd()} (paid, allowed models)` : fit(provider.next.label, 42).trimEnd(), tone: provider.next.paid ? 'warn' : 'text' } : { text: 'nothing left, requests stop', tone: 'bad' },
       ])
     }
+    if (provider.better) lines.push([{ text: '  → Next quiet prompt moves to: ', tone: 'muted' }, { text: fit(provider.better.label, 44).trimEnd(), tone: 'good' }])
   }
   lines.push([])
   lines.push([{ text: `Usage is checked every ${duration(report.pollIntervalMs)} while OpenCode is active.`, tone: 'faint' }])
-  lines.push([{ text: 'The router switches accounts only when one runs out.', tone: 'faint' }])
+  if (report.strategy === 'smart') {
+    const windows = report.providers.map(provider => `${duration(report.cacheWindows[provider.provider] ?? DEFAULT_CACHE_WINDOW_MS[provider.provider])}${report.providers.length > 1 ? ` ${PROVIDER_NAMES[provider.provider]}` : ''}`).join(', ')
+    lines.push([{ text: `Smart routing: once the prompt cache has expired (${windows} with`, tone: 'faint' }])
+    lines.push([{ text: 'no requests), a prompt moves to the account whose allowance expires', tone: 'faint' }])
+    lines.push([{ text: 'first. Mid-conversation it switches only when an account runs out.', tone: 'faint' }])
+  } else lines.push([{ text: 'The router switches accounts only when one runs out.', tone: 'faint' }])
+  if (report.logPath) {
+    // Keep the end of a long path: the file name matters more than the start.
+    const path = report.logPath.replace(/^\/(?:Users|home)\/[^/]+/u, '~')
+    lines.push([{ text: 'Log: ', tone: 'faint' }, { text: displayWidth(path) > 74 ? `…${path.slice(-73)}` : path, tone: 'faint' }])
+  }
   if (options.cli && !report.live) lines.push([{ text: 'Saved snapshot. Add --refresh for live numbers.', tone: 'faint' }])
   return lines
 }

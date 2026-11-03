@@ -18,7 +18,7 @@ describe('real compiled CLI through an npm-style bin symlink', () => {
       const bin = join(directory, 'zenox-account-router')
       await symlink(resolve('dist/cli.js'), bin)
       const help = await execute(process.execPath, [bin, '--help'], { timeout: 10_000 })
-      expect(help.stdout).toContain('zenox-account-router <setup|accounts|status|dry-run>')
+      expect(help.stdout).toContain('zenox-account-router <setup|accounts|status|dry-run|logs>')
       await mkdir(join(directory, 'fake-bin'))
       const fixture = [{ id: 'anthropic', connections: [{ type: 'credential', id: 'synthetic-a', label: 'Synthetic account', method: 'oauth' }] }]
       await writeFile(join(directory, 'fake-bin', 'opencode'), `#!/usr/bin/env node\nconst args = process.argv.slice(2);\nif (args[0] === '--version') console.log('opencode v2.2.5');\nelse if (args[0] === 'auth' && args[1] === 'list') console.log(${JSON.stringify(JSON.stringify(fixture))});\nelse process.exit(3);\n`, { mode: 0o700 })

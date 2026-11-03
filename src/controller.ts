@@ -1,9 +1,14 @@
 import { createHash } from 'node:crypto'
 import { emptyState } from './config.js'
-import { chooseInitial, usageBlocks } from './policy.js'
+import { cleanLabel, describeUsage, duration } from './display.js'
+import { chooseInitial, DEFAULT_CACHE_WINDOW_MS, planRebalance, usageBlocks } from './policy.js'
 import { adapters } from './providers/index.js'
 import { readBoundedJson } from './providers/shared.js'
-import type { Account, Fetch, ProviderAdapter, ProviderConfig, ProviderID, QuotaEvidence, RouterConfig, RouterHost, RouterState, StoredCredential, UsageSnapshot } from './types.js'
+import type { Account, Fetch, ProviderAdapter, ProviderConfig, ProviderID, QuotaEvidence, RouterConfig, RouterDecision, RouterHost, RouterState, StoredCredential, UsageSnapshot } from './types.js'
+
+/** How long a quiet-moment check may hold a prompt while it brings usage up to date. */
+const PREPARE_TIMEOUT_MS = 4_000
+const ACTIVITY_SAVE_MS = 60_000
 
 export interface RequestScope {
   sessionID: string
@@ -59,9 +64,17 @@ export class RouterController {
   private readonly scopes = new Map<string, ScopeState>()
   private readonly reclaimed = new Map<ProviderID, number>()
   private readonly reclaiming = new Map<ProviderID, Promise<void>>()
+  private readonly rebalancing = new Map<ProviderID, Promise<void>>()
+  private readonly activitySaved = new Map<ProviderID, number>()
+  private readonly ownerRefreshed = new Map<ProviderID, number>()
+  private readonly sessions = new Set<string>()
+  private readonly sessionAccounts = new Map<string, string>()
+  private readonly cacheWindows = new Map<ProviderID, { ms: number; source: string }>()
+  private readonly log: (decision: RouterDecision) => void
+  private readonly readActivity: () => Promise<RouterState['activity']>
   private readonly abort = new AbortController()
 
-  constructor(options: { config: RouterConfig; host: RouterHost; state?: RouterState; now?: () => number; fetch?: Fetch; adapters?: Record<ProviderID, ProviderAdapter>; persist?: (state: RouterState) => Promise<void> }) {
+  constructor(options: { config: RouterConfig; host: RouterHost; state?: RouterState; now?: () => number; fetch?: Fetch; adapters?: Record<ProviderID, ProviderAdapter>; persist?: (state: RouterState) => Promise<void>; log?: (decision: RouterDecision) => void; readActivity?: () => Promise<RouterState['activity']> }) {
     this.config = options.config
     this.host = options.host
     this.state = options.state ?? emptyState()
@@ -69,6 +82,35 @@ export class RouterController {
     this.fetch = options.fetch ?? globalThis.fetch
     this.adapter = options.adapters ?? adapters
     this.persist = options.persist ?? (async () => {})
+    this.log = options.log ?? (() => {})
+    this.readActivity = options.readActivity ?? (async () => undefined)
+  }
+
+  private record(decision: Omit<RouterDecision, 'at'>): void {
+    if (this.abort.signal.aborted) return
+    try { this.log({ at: this.now(), ...decision }) } catch { /* Logging never affects routing. */ }
+  }
+
+  private label(provider: ProviderID, id: string, accounts?: Account[]): string {
+    const listed = accounts?.find(account => account.id === id) ?? this.credentials.get(provider)?.values.find(account => account.id === id)
+    return cleanLabel(this.config.providers[provider]?.accountLabels?.[id] ?? listed?.label ?? id)
+  }
+
+  /** How long a conversation's prompt cache stays warm on this provider, and where that number came from. */
+  cacheWindow(provider: ProviderID): { ms: number; source: string } {
+    if (this.config.cacheWindowMs !== undefined) return { ms: this.config.cacheWindowMs, source: 'cacheWindowMs in the router config' }
+    return this.cacheWindows.get(provider) ?? { ms: DEFAULT_CACHE_WINDOW_MS[provider], source: `${provider === 'anthropic' ? 'Anthropic' : 'OpenAI'} default; OpenCode sends no cache.ttl` }
+  }
+
+  private async detectCacheWindow(provider: ProviderID): Promise<void> {
+    if (this.config.cacheWindowMs === undefined && this.host.cacheTTL) {
+      try {
+        const ttl = await this.host.cacheTTL(provider)
+        if (ttl !== undefined) this.cacheWindows.set(provider, { ms: Math.max(ttl, DEFAULT_CACHE_WINDOW_MS[provider]), source: `OpenCode cache.ttl setting (${duration(ttl)})` })
+      } catch { /* Falls back to the provider default. */ }
+    }
+    const window = this.cacheWindow(provider)
+    this.record({ provider, event: 'cache', reason: `Prompt cache counts as warm for ${duration(window.ms)} after a conversation request (${window.source}). Smart switches wait that long.` })
   }
 
   private serial<T>(operation: () => Promise<T>): Promise<T> {
@@ -111,7 +153,8 @@ export class RouterController {
     return operation
   }
 
-  async refresh(provider: ProviderID, forceEvidence = false): Promise<void> {
+  /** `retryExpired` re-checks accounts whose last check saw an expired token (after an owner refresh). */
+  async refresh(provider: ProviderID, forceEvidence = false, retryExpired = false): Promise<void> {
     const settings = this.config.providers[provider]
     if (!settings || this.suspended.has(provider) || this.abort.signal.aborted) return
     const pending = this.polling.get(provider)
@@ -123,6 +166,7 @@ export class RouterController {
         const value = this.state.usage[key]
         if (value?.retryAt && value.retryAt > now) return false
         if (forceEvidence) return now - (this.probes.get(key) ?? -Infinity) >= 60_000
+        if (retryExpired && value?.status === 'expired' && now - value.checkedAt >= 60_000) return true
         return !value || now - value.checkedAt >= settingsInterval(this.config)
       })
       if (!due.length) return
@@ -139,6 +183,7 @@ export class RouterController {
           usage = { ...usage, retryAt: Math.max(usage.retryAt ?? 0, now + Math.min(3_600_000, this.config.pollIntervalMs * 2 ** (failures - 1))) }
         } else this.failures.delete(key)
         this.state.usage[key] = usage
+        this.record({ provider, event: 'usage', level: usage.status === 'ok' || usage.status === 'expired' ? 'info' : 'warn', from: this.label(provider, id, credentials), reason: describeUsage(usage, now) })
       }
       await this.save()
     })().catch(() => undefined).finally(() => this.polling.delete(provider))
@@ -156,28 +201,28 @@ export class RouterController {
       const before = await this.host.listAccounts()
       const current = before.find(account => account.provider === provider && account.active)
       // Leave a manually chosen unselected account alone, without monitoring or resolving anything.
-      if (current && !this.selected(provider, before).some(account => account.id === current.id)) {
+      const pause = (account: Account): void => {
         this.suspended.add(provider)
         this.initialized.add(provider)
-        return
+        this.record({ provider, event: 'pause', from: cleanLabel(account.label), reason: 'The active account is not one the router manages, so routing is paused.' })
       }
+      if (current && !this.selected(provider, before).some(account => account.id === current.id)) return pause(current)
+      await this.detectCacheWindow(provider)
       await this.refresh(provider)
       const accounts = await this.host.listAccounts()
       const active = accounts.find(account => account.provider === provider && account.active)
       const selected = this.selected(provider, accounts)
-      if (active && !selected.some(account => account.id === active.id)) {
-        this.suspended.add(provider)
-        this.initialized.add(provider)
-        return
-      }
+      if (active && !selected.some(account => account.id === active.id)) return pause(active)
       const initial = selected.filter(account => account.active || !this.blocked(provider, account.id, this.now()))
-      const choice = active?.method === 'key' ? active.id : chooseInitial(settings, initial, Object.values(this.state.usage), this.now()).accountID
+      const decision = active?.method === 'key' ? undefined : chooseInitial(settings, initial, Object.values(this.state.usage), this.now(), this.config.strategy)
+      const choice = active?.method === 'key' ? active.id : decision?.accountID
       if (choice) {
         if (choice !== active?.id) {
           const latest = (await this.host.listAccounts()).find(account => account.provider === provider && account.active)
           if (latest?.id !== active?.id) return
           await this.host.activate(provider, choice)
-        }
+          this.record({ provider, event: 'start', ...(active ? { from: this.label(provider, active.id, accounts) } : {}), to: this.label(provider, choice, accounts), reason: decision?.reason ?? 'Initial selection.' })
+        } else this.record({ provider, event: 'start', to: this.label(provider, choice, accounts), reason: 'Router started on the account that was already active.' })
         this.state.sticky[provider] = choice
       }
       this.initialized.add(provider)
@@ -199,6 +244,9 @@ export class RouterController {
     if (!provider || !this.config.providers[provider] || this.suspended.has(provider) || this.abort.signal.aborted) return
     this.prune()
     this.lastActivity.set(provider, this.now())
+    // Conversation, compaction and session-context generation (also used by OpenCode's cache warming) keep
+    // the prompt cache warm; title requests use a small separate prompt and do not.
+    if (scope.kind !== 'title') this.touch(provider)
     void this.refresh(provider)
     const key = scopeKey(scope)
     const current = this.scopes.get(key) ?? { records: new Set<RequestRecord>(), generation: 0, visited: new Set<string>(), lastAttempt: 0, at: this.now() }
@@ -214,6 +262,20 @@ export class RouterController {
     let matches = credentials.filter(value => this.adapter[provider].matchesRequest(value, request))
     if (!matches.length) matches = (await this.readCredentials(provider, { force: true })).filter(value => this.adapter[provider].matchesRequest(value, request))
     if (matches.length === 1) record.accountID = matches[0]!.id
+    if (scope.kind === 'primary') this.noteUse(provider, scope, record.accountID, credentials)
+  }
+
+  /** Logs which account a session's conversation requests go to, once per session and whenever it changes. */
+  private noteUse(provider: ProviderID, scope: RequestScope, accountID: string | undefined, credentials: StoredCredential[]): void {
+    const key = `${provider}:${scope.sessionID}`
+    const previous = this.sessionAccounts.get(key)
+    const value = accountID ?? '?'
+    if (previous === value) return
+    this.sessionAccounts.delete(key)
+    this.sessionAccounts.set(key, value)
+    while (this.sessionAccounts.size > 1000) this.sessionAccounts.delete(this.sessionAccounts.keys().next().value!)
+    if (accountID) this.record({ provider, event: 'use', to: this.label(provider, accountID, credentials), reason: `Session ${scope.sessionID} (${scope.model.id})${previous && previous !== '?' ? ` moved from ${this.label(provider, previous, credentials)}` : ''}.` })
+    else this.record({ provider, event: 'use', level: 'warn', reason: `Session ${scope.sessionID} (${scope.model.id}) sent a request the router could not match to a selected account (another account, or the router loaded before the auth plugin). It will not fail over for this request.` })
   }
 
   async onResponse(scope: RequestScope, request: Request, response: Response): Promise<void> {
@@ -242,6 +304,17 @@ export class RouterController {
         }
       }
     }
+    const who = this.label(provider, record.accountID)
+    const resets = evidence.resetAt && evidence.resetAt > this.now() ? `, resets in ${duration(evidence.resetAt - this.now())}` : ''
+    const outcomes: Record<QuotaEvidence['kind'], [RouterDecision['event'], RouterDecision['level'], string]> = {
+      quota: evidence.scope === 'account' ? ['quota', 'warn', `${who} was rejected because its allowance is used up (HTTP ${response.status}${evidence.code ? `, ${evidence.code}` : ''}${resets}). Looking for another account.`] : ['ignored', 'info', `${who}: a model-specific limit (HTTP ${response.status}); not a reason to switch accounts.`],
+      transient: ['ignored', 'info', `${who}: temporary rate limit or overload (HTTP ${response.status}${evidence.code ? `, ${evidence.code}` : ''}); OpenCode retries on the same account.`],
+      'model-restriction': ['ignored', 'info', `${who}: this model or feature is not included in the plan (HTTP ${response.status}); switching accounts would not help.`],
+      auth: ['ignored', 'warn', `${who}: sign-in was rejected (HTTP ${response.status}); OpenCode's auth plugin handles this, the router does not switch.`],
+      unknown: ['ignored', 'info', `${who}: request failed (HTTP ${response.status}) for a reason that is not an account limit; left to OpenCode.`],
+    }
+    const [event, level, reason] = outcomes[evidence.kind]
+    this.record({ provider, event, level, from: who, reason })
     if (evidence.kind !== 'quota' || evidence.scope !== 'account' || generation !== current.generation) return
     if (provider === 'openai' && response.headers.has('x-codex-active-limit') && response.headers.get('x-codex-active-limit') !== 'codex') return
     current.rejection = { accountID: record.accountID, status: response.status, digest: fingerprint, evidence, at: this.now(), generation }
@@ -290,18 +363,25 @@ export class RouterController {
         return true
       }
       const alternatives = selected.filter(account => account.method === 'oauth' && usable(account) && !current.visited.has(account.id) && !this.blocked(provider, account.id, now))
-      const choice = chooseInitial(settings, alternatives.map(account => ({ ...account, active: false })), Object.values(this.state.usage), now).accountID
+      const choice = chooseInitial(settings, alternatives.map(account => ({ ...account, active: false })), Object.values(this.state.usage), now, this.config.strategy).accountID
       let next = choice
       if (!next && settings.allowPaidFallback && settings.apiKeyAccountID && settings.apiKeyModels.includes(input.model.id) && settings.accountIDs.every(id => selected.some(account => account.id === id && account.method === 'oauth' && usable(account)) && this.confirmedExhausted(provider, id, now))) {
         const key = selected.find(account => account.id === settings.apiKeyAccountID && account.method === 'key' && !account.needsAuth)
         if (key && usable(key) && !current.visited.has(key.id) && !this.blocked(provider, key.id, now)) next = key.id
       }
-      if (!next) { await this.save(); return false }
+      if (!next) {
+        const why = selected.filter(account => account.method === 'oauth' && account.id !== rejection.accountID).map(account => `${this.label(provider, account.id, accounts)}: ${!usable(account) ? 'needs sign-in or its token is unavailable' : current.visited.has(account.id) ? 'already tried for this prompt' : this.blocked(provider, account.id, now) ? 'also out of allowance' : 'not usable right now'}`)
+        const paid = !settings.allowPaidFallback || !settings.apiKeyAccountID ? 'paid fallback is off' : !settings.apiKeyModels.includes(input.model.id) ? `model ${input.model.id} is not on the paid-key allowlist` : 'the paid key needs every subscription to be confirmed out first'
+        this.record({ provider, event: 'no-switch', level: 'warn', from: this.label(provider, rejection.accountID, accounts), reason: `Out of allowance and no safe account to move to (${[...why, paid].join('; ')}). The request ends with the provider's error.` })
+        await this.save()
+        return false
+      }
       const latest = (await this.host.listAccounts()).find(account => account.provider === provider && account.active)
       if (!valid()) { discardStale(); return false }
       if (latest?.id !== rejection.accountID) { await this.save(); return false }
       const settled = await this.host.activate(provider, next)
       this.state.sticky[provider] = next
+      this.record({ provider, event: 'failover', from: this.label(provider, rejection.accountID, accounts), to: this.label(provider, next, accounts), reason: next === settings.apiKeyAccountID ? 'Every subscription is out of allowance; using the paid key for an allowed model.' : `${this.label(provider, rejection.accountID, accounts)} hit its limit${reset && reset > now ? ` (back in ${duration(reset - now)})` : ''}.` })
       // If the provider could not confirm the switch applied, give OpenCode's reload time first.
       input.decision = { retry: true, delay: settled === false ? 3_000 : 0 }
       await this.save()
@@ -343,10 +423,11 @@ export class RouterController {
       if (!candidates.length) return
       const credentials = await this.readCredentials(provider, { refresh: true })
       const usable = candidates.filter(account => credentials.some(value => value.id === account.id && value.method === 'oauth' && !value.needsAuth && !!value.access && (!value.expiresAt || value.expiresAt > now)))
-      const choice = chooseInitial(settings, usable.map(account => ({ ...account, active: false })), Object.values(this.state.usage), now).accountID
+      const choice = chooseInitial(settings, usable.map(account => ({ ...account, active: false })), Object.values(this.state.usage), now, this.config.strategy).accountID
       if (!choice || !onKey(await this.host.listAccounts())) return
       await this.host.activate(provider, choice)
       this.state.sticky[provider] = choice
+      this.record({ provider, event: 'reclaim', from: this.label(provider, settings.apiKeyAccountID!, accounts), to: this.label(provider, choice, accounts), reason: 'A subscription is usable again, so the paid key is no longer needed.' })
       await this.save()
     })
   }
@@ -360,6 +441,108 @@ export class RouterController {
     return !!cooldown && !cooldown.model && cooldown.until > now && cooldown.confirmedAt <= now && now - cooldown.confirmedAt <= 86_400_000
   }
 
+  private touch(provider: ProviderID): void {
+    const now = this.now()
+    const activity = this.state.activity ??= {}
+    activity[provider] = Math.max(activity[provider] ?? 0, now)
+    // Persisted (throttled) so a restart or another OpenCode process still sees the warm cache.
+    if (now - (this.activitySaved.get(provider) ?? -Infinity) < ACTIVITY_SAVE_MS) return
+    this.activitySaved.set(provider, now)
+    void this.save()
+  }
+
+  /** Time since the last conversation request on this provider, from any session or router process. */
+  private async quietFor(provider: ProviderID, includeShared: boolean): Promise<number> {
+    if (includeShared) {
+      try {
+        const shared = (await this.readActivity())?.[provider]
+        if (shared !== undefined && shared <= this.now()) {
+          const activity = this.state.activity ??= {}
+          activity[provider] = Math.max(activity[provider] ?? 0, shared)
+        }
+      } catch { /* Unreadable shared state only means we rely on what this process saw. */ }
+    }
+    const last = this.state.activity?.[provider]
+    return last === undefined ? Infinity : this.now() - last
+  }
+
+  /**
+   * Smart routing, called at every prompt boundary before that prompt's requests are built. Switching
+   * drops the provider prompt cache, so it only happens when no conversation request has gone out on
+   * this provider for `cacheWindowMs` (a new session after a break, or work resuming after idling), or
+   * when the active account is already out of allowance and its cache is lost anyway. Mid-conversation,
+   * failover in `onRetry` stays the only way accounts change.
+   */
+  async rebalance(provider: ProviderID, sessionID?: string): Promise<void> {
+    const settings = this.config.providers[provider]
+    if (!settings || this.config.strategy !== 'smart' || !this.initialized.has(provider) || this.suspended.has(provider) || this.abort.signal.aborted) return
+    const firstPrompt = sessionID !== undefined && !this.sessions.has(sessionID)
+    if (sessionID !== undefined) {
+      this.sessions.add(sessionID)
+      while (this.sessions.size > 1000) this.sessions.delete(this.sessions.values().next().value!)
+    }
+    const pending = this.rebalancing.get(provider)
+    if (pending) return pending
+    const operation = this.evaluate(provider, settings, firstPrompt).catch(() => undefined).finally(() => this.rebalancing.delete(provider))
+    this.rebalancing.set(provider, operation)
+    return operation
+  }
+
+  private async evaluate(provider: ProviderID, settings: ProviderConfig, firstPrompt: boolean): Promise<void> {
+    const accounts = await this.host.listAccounts()
+    const active = accounts.find(account => account.provider === provider && account.active)
+    // The paid key is reclaim's job; unselected or signed-out accounts are left alone.
+    if (!active || active.method !== 'oauth' || active.needsAuth || !this.selected(provider, accounts).some(account => account.id === active.id)) return
+    const window = this.cacheWindow(provider).ms
+    let quiet = await this.quietFor(provider, false)
+    if (quiet >= window) quiet = await this.quietFor(provider, true)
+    const exhausted = this.blocked(provider, active.id, this.now())
+    if (quiet < window && !exhausted) {
+      const ago = duration(quiet) === 'now' ? 'moments ago' : `${duration(quiet)} ago`
+      if (firstPrompt) this.record({ provider, event: 'wait', from: this.label(provider, active.id, accounts), reason: `New session, but a conversation used this account ${ago}; switching now would drop its prompt cache.` })
+      return
+    }
+    await this.within(this.prepare(provider, settings), PREPARE_TIMEOUT_MS)
+    await this.serial(async () => {
+      if (this.abort.signal.aborted) return
+      const now = this.now()
+      const latest = await this.host.listAccounts()
+      const current = latest.find(account => account.provider === provider && account.active)
+      if (current?.id !== active.id || current.method !== 'oauth') return
+      const blocked = this.blocked(provider, current.id, now)
+      // A conversation (here or in another router process) may have started while usage was being refreshed.
+      if (!blocked && (await this.quietFor(provider, true)) < window) return
+      const labeled = (account: Account): Account => ({ ...account, label: this.label(provider, account.id, latest) })
+      const candidates = this.selected(provider, latest).filter(account => account.method === 'oauth' && !account.needsAuth && account.id !== current.id && !this.blocked(provider, account.id, now))
+      const plan = planRebalance(settings, labeled(current), candidates.map(labeled), Object.values(this.state.usage), now, { maxAge: this.config.pollIntervalMs, currentBlocked: blocked })
+      if (!plan.accountID) {
+        this.record({ provider, event: 'keep', from: this.label(provider, current.id, latest), reason: plan.reason })
+        return
+      }
+      await this.host.activate(provider, plan.accountID)
+      this.state.sticky[provider] = plan.accountID
+      this.record({ provider, event: 'switch', from: this.label(provider, current.id, latest), to: this.label(provider, plan.accountID, latest), reason: plan.reason })
+      await this.save()
+    })
+  }
+
+  /** Brings usage up to date for a quiet-moment decision; idle accounts' expired tokens are refreshed by OpenCode at most once per poll interval. */
+  private async prepare(provider: ProviderID, settings: ProviderConfig): Promise<void> {
+    const now = this.now()
+    const expired = settings.accountIDs.some(id => this.state.usage[`${provider}:${id}`]?.status === 'expired')
+    if (expired && now - (this.ownerRefreshed.get(provider) ?? -Infinity) >= this.config.pollIntervalMs) {
+      this.ownerRefreshed.set(provider, now)
+      await this.readCredentials(provider, { refresh: true })
+    }
+    await this.refresh(provider, false, expired)
+  }
+
+  private async within(operation: Promise<unknown>, milliseconds: number): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const limit = new Promise<void>(resolve => { timer = setTimeout(resolve, milliseconds) })
+    try { await Promise.race([operation.catch(() => undefined), limit]) } finally { clearTimeout(timer) }
+  }
+
   async tick(): Promise<void> {
     this.prune()
     for (const [provider, at] of this.lastActivity) if (this.now() - at < this.config.idleTimeoutMs) await this.refresh(provider)
@@ -369,6 +552,14 @@ export class RouterController {
     this.abort.abort()
     this.credentials.clear()
     this.scopes.clear()
+  }
+
+  /** Persists activity still inside the save throttle, then resolves once queued state writes have finished. */
+  async drain(): Promise<void> {
+    const unsaved = (Object.entries(this.state.activity ?? {}) as [ProviderID, number | undefined][]).filter(([provider, at]) => at !== undefined && at > (this.activitySaved.get(provider) ?? -Infinity))
+    for (const [provider, at] of unsaved) this.activitySaved.set(provider, at!)
+    if (unsaved.length) await this.save()
+    await this.saving
   }
 }
 

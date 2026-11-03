@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest'
 import { emptyState, parseConfig } from '../src/config.js'
 import { RouterController } from '../src/controller.js'
 import type { RetryInput, RequestScope } from '../src/controller.js'
-import { chooseInitial } from '../src/policy.js'
+import { chooseInitial, DEFAULT_CACHE_WINDOW_MS, planRebalance, standing } from '../src/policy.js'
 import { adapters, readBoundedJson } from '../src/providers/index.js'
 import type { Account, ProviderID, RouterHost, StoredCredential, UsageSnapshot } from '../src/types.js'
 
@@ -213,5 +213,98 @@ describe('controller under random event interleavings', () => {
     // Guard against a vacuous property: random runs must actually exercise switching and paid fallback.
     expect(switched).toBeGreaterThan(20)
     expect(paidSwitches).toBeGreaterThan(0)
+  })
+})
+
+describe('smart routing invariants', () => {
+  const snapshotArb = (id: string) => fc.record({
+    session: fc.option(fc.integer({ min: -60, max: 300 })), weekly: fc.option(fc.integer({ min: -60, max: 10_080 })),
+    used: fc.integer({ min: 0, max: 100 }), weeklyUsed: fc.integer({ min: 0, max: 100 }), age: fc.integer({ min: 0, max: 1_200_000 }),
+    allowed: fc.option(fc.boolean()), status: fc.constantFrom('ok' as const, 'ok' as const, 'ok' as const, 'expired' as const, 'unavailable' as const),
+  }).map((value): UsageSnapshot => ({
+    provider: 'anthropic', accountID: id, checkedAt: now - value.age, status: value.status,
+    windows: [
+      { id: 'five_hour', label: '5-hour', durationSeconds: 18_000, usedPercent: value.used, resetsAt: value.session === null ? null : now + value.session * 60_000 },
+      { id: 'seven_day', label: 'Weekly', durationSeconds: 604_800, usedPercent: value.weeklyUsed, resetsAt: value.weekly === null ? null : now + value.weekly * 60_000 },
+    ],
+    ...(value.allowed !== null ? { allowed: value.allowed } : {}),
+  }))
+
+  it('a plan only ever moves to a selected, signed-in, usable subscription with fresh evidence, and never back on the same evidence', () => {
+    fc.assert(fc.property(snapshotArb('a'), snapshotArb('b'), snapshotArb('c'), fc.boolean(), fc.boolean(), (ua, ub, uc, bAuth, blocked) => {
+      const settings = { accountIDs: ['a', 'b', 'c'], allowPaidFallback: false, apiKeyModels: [] }
+      const account = (id: string, extra: Partial<Account> = {}): Account => ({ id, provider: 'anthropic', label: id, method: 'oauth', active: false, ...extra })
+      const evidence = [ua, ub, uc]
+      const plan = planRebalance(settings, account('a', { active: true }), [account('b', bAuth ? { needsAuth: true } : {}), account('c'), account('key', { method: 'key' })], evidence, now, { currentBlocked: blocked })
+      if (plan.kind === 'keep') { expect(plan.accountID).toBeUndefined(); return }
+      expect(['b', 'c']).toContain(plan.accountID)
+      if (plan.accountID === 'b') expect(bAuth).toBe(false)
+      const target = standing(evidence.find(item => item.accountID === plan.accountID), now)
+      expect(target).toMatchObject({ fresh: true, blocked: false, headroom: true })
+      if (!blocked) {
+        const back = planRebalance(settings, account(plan.accountID!, { active: true }), [account('a')], evidence, now)
+        expect(back.kind).toBe('keep')
+      }
+    }), { numRuns: 3000 })
+  })
+
+  it.each(providers)('%s: under random prompts and traffic, a smart switch only happens once every conversation cache has gone quiet', async provider => {
+    let smartSwitches = 0
+    type Step = { type: 'prompt'; session: number } | { type: 'traffic'; session: number; kind: RequestScope['kind'] } | { type: 'advance'; ms: number } | { type: 'usage'; a: number; b: number }
+    const step: fc.Arbitrary<Step> = fc.oneof(
+      fc.record({ type: fc.constant('prompt' as const), session: fc.integer({ min: 0, max: 3 }) }),
+      fc.record({ type: fc.constant('traffic' as const), session: fc.integer({ min: 0, max: 3 }), kind: fc.constantFrom('primary' as const, 'compaction' as const, 'title' as const, 'generate' as const) }),
+      fc.record({ type: fc.constant('advance' as const), ms: fc.integer({ min: 0, max: 2_400_000 }) }),
+      fc.record({ type: fc.constant('usage' as const), a: fc.integer({ min: 1, max: 300 }), b: fc.integer({ min: 1, max: 300 }) }),
+    )
+    await fc.assert(fc.asyncProperty(fc.array(step, { minLength: 1, maxLength: 30 }), async steps => {
+      let clock = now
+      let resets = { a: 200, b: 60 }
+      const values = (['a', 'b', 'key'] as const).map(id => id === 'key' ? { id, provider, label: id, method: 'key' as const, active: false, key: `fuzz-key-${provider}` } : credential(provider, id))
+      const accounts: Account[] = values.map(({ id, label, method, active }) => ({ id, provider, label, method, active }))
+      const activations: string[] = []
+      const host: RouterHost = {
+        listAccounts: async () => structuredClone(accounts),
+        readCredentials: async () => structuredClone(values).map(value => ({ ...value, active: accounts.find(account => account.id === value.id)!.active })),
+        activate: async (_provider, id) => { activations.push(id); for (const account of accounts) account.active = account.id === id },
+      }
+      const fetch: typeof globalThis.fetch = async (_input, init) => {
+        const auth = new Headers(init?.headers).get('authorization') ?? ''
+        const minutes = auth.endsWith('-a') ? resets.a : resets.b
+        const reset = clock + minutes * 60_000
+        return Response.json(provider === 'anthropic'
+          ? { five_hour: { utilization: 20, resets_at: new Date(reset).toISOString() }, seven_day: { utilization: 30, resets_at: new Date(clock + 604_800_000).toISOString() } }
+          : { rate_limit: { allowed: true, primary_window: { used_percent: 20, limit_window_seconds: 18_000, reset_at: reset / 1000 }, secondary_window: { used_percent: 30, limit_window_seconds: 604_800, reset_at: (clock + 604_800_000) / 1000 } } })
+      }
+      const config = parseConfig({ version: 1, providers: { [provider]: { accountIDs: ['a', 'b'], allowPaidFallback: true, apiKeyAccountID: 'key', apiKeyModels: ['model'] } } })
+      const controller = new RouterController({ config, host, state: emptyState(), now: () => clock, fetch })
+      let lastConversation = -Infinity
+      try {
+        await controller.initialize(provider)
+        for (const item of steps) {
+          if (item.type === 'advance') { clock += item.ms; continue }
+          if (item.type === 'usage') { resets = { a: item.a, b: item.b }; continue }
+          if (item.type === 'traffic') {
+            const active = accounts.find(account => account.active)!
+            const value = values.find(entry => entry.id === active.id)!
+            const headers = new Headers(provider === 'anthropic' && value.method === 'key' ? { 'x-api-key': value.key! } : { authorization: `Bearer ${value.method === 'key' ? value.key : value.access}` })
+            const scope: RequestScope = { sessionID: `s${item.session}`, agent: 'build', model: { providerID: provider, id: 'model' }, kind: item.kind }
+            const request = new Request(provider === 'anthropic' ? 'https://api.anthropic.com/v1/messages' : 'https://chatgpt.com/backend-api/codex/responses', { method: 'POST', headers, body: '{}' })
+            await controller.onRequest(scope, request)
+            await controller.onResponse(scope, request, new Response('{}', { status: 200 }))
+            if (item.kind !== 'title') lastConversation = clock
+            continue
+          }
+          const before = activations.length
+          await controller.rebalance(provider, `s${item.session}`)
+          if (activations.length > before) {
+            smartSwitches++
+            expect(clock - lastConversation).toBeGreaterThanOrEqual(DEFAULT_CACHE_WINDOW_MS[provider])
+            expect(['a', 'b']).toContain(activations.at(-1))
+          }
+        }
+      } finally { controller.stop() }
+    }), { numRuns: 200 })
+    expect(smartSwitches).toBeGreaterThan(20)
   })
 })

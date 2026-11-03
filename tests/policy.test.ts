@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { chooseInitial, freshUsage, usageBlocks } from '../src/policy.js'
+import { chooseInitial, compareStanding, freshUsage, planRebalance, rankAccounts, standing, usageBlocks } from '../src/policy.js'
 import type { Account, ProviderConfig, UsageSnapshot, UsageWindow } from '../src/types.js'
 
 const now = Date.parse('2026-11-02T12:00:00Z')
@@ -90,5 +90,139 @@ describe('initial subscription selection', () => {
         expect(candidates.filter(candidate => candidate.method === 'oauth' && !candidate.needsAuth && settings.accountIDs.includes(candidate.id) && (candidate.active || !usageBlocks(evidence.find(item => item.accountID === candidate.id), now))), `mask=${mask}`).toHaveLength(0)
       }
     }
+  })
+})
+
+describe('smart standing and ranking', () => {
+  const at = (minutes: number): number => now + minutes * 60_000
+  const smart = (accountID: string, session: number | null, weekly: number | null, used = 20, weeklyUsed = 30): UsageSnapshot => usage(accountID, { windows: [window(18_000, session === null ? 0 : used, session === null ? null : at(session)), window(604_800, weeklyUsed, weekly === null ? null : at(weekly))] })
+
+  it('summarises fresh usage into running resets, room left and headroom', () => {
+    expect(standing(smart('a', 90, 3000, 40, 70), now)).toEqual({ fresh: true, blocked: false, headroom: true, left: 30, sessionReset: at(90), weeklyReset: at(3000) })
+    expect(standing(smart('a', null, null), now)).toEqual({ fresh: true, blocked: false, headroom: true, left: 70 })
+    expect(standing(smart('a', 90, 3000, 96), now)).toMatchObject({ headroom: false, left: 4 })
+    expect(standing(smart('a', 90, 3000, 100), now)).toMatchObject({ blocked: true, headroom: false })
+    expect(standing(usage('a', { allowed: false, windows: [] }), now)).toMatchObject({ blocked: true, headroom: false })
+    // A window that already reset counts as full and not running.
+    expect(standing(usage('a', { windows: [window(18_000, 100, now - 1)] }), now)).toEqual({ fresh: true, blocked: false, headroom: true, left: 100 })
+    // Model-only and unknown windows never decide account-wide routing.
+    expect(standing(usage('a', { windows: [window(18_000, 100, at(10), 'opus'), window(604_800, null, at(10))] }), now)).toEqual({ fresh: true, blocked: false, headroom: true, left: 100 })
+    for (const overrides of [{ checkedAt: now - 600_001 }, { checkedAt: now + 1 }, { status: 'unavailable' as const }]) {
+      expect(standing(usage('a', { ...overrides, windows: [window(18_000, 10, at(10))] }), now)).toEqual({ fresh: false, blocked: false, headroom: false, left: 0 })
+    }
+  })
+
+  it('orders known, usable, roomy accounts first, then the allowance that expires soonest', () => {
+    const ordered = [
+      standing(smart('a', 30, 1000), now),
+      standing(smart('a', 60, 500), now),
+      standing(smart('a', null, 400), now),
+      standing(smart('a', null, null), now),
+      standing(smart('a', 10, 100, 97), now),
+      standing(smart('a', 10, 100, 100), now),
+      standing(undefined, now),
+    ]
+    for (let i = 0; i < ordered.length; i++) for (let j = 0; j < ordered.length; j++) {
+      expect(Math.sign(compareStanding(ordered[i]!, ordered[j]!)), `${i} vs ${j}`).toBe(Math.sign(i - j))
+    }
+  })
+
+  it('breaks exact ties by favorite, then configured order', () => {
+    const accounts = [account('a'), account('b'), account('c')]
+    const same = ['a', 'b', 'c'].map(id => smart(id, 60, 1000))
+    expect(rankAccounts({ ...config, accountIDs: ['a', 'b', 'c'] }, accounts, same, now).map(item => item.id)).toEqual(['a', 'b', 'c'])
+    expect(rankAccounts({ ...config, accountIDs: ['a', 'b', 'c'], favoriteAccountID: 'c' }, accounts, same, now).map(item => item.id)).toEqual(['c', 'a', 'b'])
+    expect(rankAccounts({ ...config, accountIDs: ['c', 'b', 'a'] }, accounts, same, now).map(item => item.id)).toEqual(['c', 'b', 'a'])
+  })
+
+  it('smart initial choice drains the soonest-expiring allowance, with the favorite only as a tie-break', () => {
+    const evidence = [smart('a', 200, 1000), smart('b', 60, 1000)]
+    expect(chooseInitial({ ...config, favoriteAccountID: 'a' }, [account('a'), account('b')], evidence, now, 'smart')).toMatchObject({ accountID: 'b', kind: 'best' })
+    expect(chooseInitial({ ...config, favoriteAccountID: 'a' }, [account('a'), account('b')], evidence, now, 'sticky')).toMatchObject({ accountID: 'a', kind: 'favorite' })
+    expect(chooseInitial({ ...config, favoriteAccountID: 'b' }, [account('a'), account('b')], [smart('a', 60, 1000), smart('b', 60, 1000)], now, 'smart').accountID).toBe('b')
+    expect(chooseInitial(config, [account('a', { active: true }), account('b')], evidence, now, 'smart')).toMatchObject({ accountID: 'a', kind: 'sticky' })
+    expect(chooseInitial(config, [account('a'), account('b'), account('key', { method: 'key' })], [usage('a', { allowed: false }), usage('b', { allowed: false })], now, 'smart').accountID).toBeUndefined()
+  })
+})
+
+describe('smart rebalance plan', () => {
+  const at = (minutes: number): number => now + minutes * 60_000
+  const smart = (accountID: string, session: number | null, weekly: number | null, used = 20, weeklyUsed = 30): UsageSnapshot => usage(accountID, { windows: [window(18_000, session === null ? 0 : used, session === null ? null : at(session)), window(604_800, weeklyUsed, weekly === null ? null : at(weekly))] })
+  const a = account('a', { active: true, label: 'Vranda' })
+  const b = account('b', { label: 'Team' })
+  const plan = (evidence: UsageSnapshot[], options: Parameters<typeof planRebalance>[5] = {}, candidates = [b]) => planRebalance(config, a, candidates, evidence, now, options)
+
+  it("switches in the user's case: the standby's 5-hour window expires two hours sooner", () => {
+    expect(plan([smart('a', 222, 6960, 14, 30), smart('b', 102, 5700, 2, 22)])).toEqual({
+      accountID: 'b', kind: 'switch',
+      reason: "Team's 5-hour window resets in 1h 42m, Vranda's in 3h 42m; use the allowance that expires first.",
+    })
+  })
+
+  it('needs at least a 30-minute lead on the 5-hour window', () => {
+    expect(plan([smart('a', 120, 1000), smart('b', 91, 1000)]).kind).toBe('keep')
+    expect(plan([smart('a', 120, 1000), smart('b', 90, 1000)]).kind).toBe('switch')
+    expect(plan([smart('a', 60, 1000), smart('b', 120, 1000)])).toMatchObject({ kind: 'keep', reason: "Vranda's 5-hour window resets first (1h 0m vs 2h 0m)." })
+  })
+
+  it('prefers draining a running window over starting a new one', () => {
+    expect(plan([smart('a', null, 1000), smart('b', 200, 1000)])).toMatchObject({ kind: 'switch', accountID: 'b' })
+    expect(plan([smart('a', 200, 1000), smart('b', null, 1000)])).toMatchObject({ kind: 'keep', reason: "Vranda's 5-hour window is running and Team's is not." })
+  })
+
+  it('falls back to weekly resets with a 12-hour lead when 5-hour windows do not decide', () => {
+    expect(plan([smart('a', null, 2000), smart('b', null, 2000 - 720)]).kind).toBe('switch')
+    expect(plan([smart('a', null, 2000), smart('b', null, 2000 - 719)]).kind).toBe('keep')
+    expect(plan([smart('a', 100, 2000), smart('b', 90, 1000)])).toMatchObject({ kind: 'switch', accountID: 'b' })
+    expect(plan([smart('a', null, null), smart('b', null, 3000)])).toMatchObject({ kind: 'switch', reason: "Team's weekly allowance resets in 2d 2h, Vranda's has not started; use the allowance that expires first." })
+    expect(plan([smart('a', null, 3000), smart('b', null, null)]).kind).toBe('keep')
+  })
+
+  it('moves off an exhausted or nearly empty account, but never onto one', () => {
+    expect(plan([smart('a', 200, 1000, 100), smart('b', 300, 1000)])).toMatchObject({ kind: 'switch', reason: 'Vranda is out of allowance.' })
+    expect(plan([smart('a', 200, 1000), smart('b', 300, 1000)], { currentBlocked: true })).toMatchObject({ kind: 'switch' })
+    expect(plan([smart('a', 200, 1000, 96), smart('b', 300, 1000)])).toMatchObject({ kind: 'switch', reason: 'Vranda has under 5% left.' })
+    expect(plan([smart('a', 200, 1000, 20, 96), smart('b', 300, 1000)])).toMatchObject({ kind: 'switch' })
+    for (const other of [smart('b', 10, 1000, 100), smart('b', 10, 1000, 96), smart('b', 10, 1000, 20, 99), usage('b', { allowed: false })]) {
+      expect(plan([smart('a', 200, 1000, 100), other]), JSON.stringify(other)).toMatchObject({ kind: 'keep', reason: 'Team has no room left either.' })
+    }
+  })
+
+  it('never acts on missing or stale usage', () => {
+    expect(plan([smart('a', 200, 1000)])).toMatchObject({ kind: 'keep', reason: 'No recent usage for Team yet.' })
+    expect(plan([smart('b', 10, 1000)])).toMatchObject({ kind: 'keep', reason: 'No recent usage for Vranda yet.' })
+    expect(plan([smart('a', 200, 1000), { ...smart('b', 10, 1000), checkedAt: now - 600_001 }]).kind).toBe('keep')
+    expect(plan([smart('a', 200, 1000), { ...smart('b', 10, 1000), checkedAt: now - 120_000 }], { maxAge: 60_000 }).kind).toBe('keep')
+  })
+
+  it('only considers selected, signed-in subscriptions of the same provider other than the current one', () => {
+    const evidence = [smart('a', 200, 1000), smart('b', 10, 1000), smart('key', 10, 1000), smart('outside', 10, 1000), { ...smart('c', 10, 1000), provider: 'openai' as const }]
+    const candidates = [a, account('b', { needsAuth: true }), account('key', { method: 'key' }), account('outside'), account('c', { provider: 'openai' })]
+    expect(planRebalance({ ...config, accountIDs: ['a', 'b', 'c'] }, a, candidates, evidence, now)).toEqual({ kind: 'keep', reason: 'No other selected account is available.' })
+  })
+
+  it('picks the best of several candidates', () => {
+    const c = account('c', { label: 'Spare' })
+    const evidence = [smart('a', 250, 1000), smart('b', 200, 1000), smart('c', 60, 1000)]
+    expect(planRebalance({ ...config, accountIDs: ['a', 'b', 'c'] }, a, [b, c], evidence, now)).toMatchObject({ kind: 'switch', accountID: 'c' })
+  })
+
+  it('is never undone by the same evidence (no flapping), exhaustively over a grid of usage', () => {
+    const sessions = [null, 5, 30, 61, 120, 299]
+    const weeks = [null, 100, 900, 2000, 9000]
+    const used = [0, 50, 95, 96, 100]
+    const grid: UsageSnapshot[][] = []
+    for (const s of sessions) for (const w of weeks) for (const u of used) grid.push([smart('x', s, w, u, u === 100 ? 30 : 40)])
+    let switches = 0
+    for (const [left] of grid) for (const [right] of grid) {
+      const evidence = [{ ...left!, accountID: 'a' }, { ...right!, accountID: 'b' }]
+      const forward = planRebalance(config, account('a', { active: true }), [account('b')], evidence, now)
+      if (forward.kind !== 'switch') continue
+      switches++
+      const back = planRebalance(config, account('b', { active: true }), [account('a')], evidence, now)
+      expect(back.kind, `${JSON.stringify(evidence)} -> ${forward.reason} / ${back.reason}`).toBe('keep')
+      expect(usageBlocks(evidence[1], now)).toBe(false)
+    }
+    expect(switches).toBeGreaterThan(grid.length * 10)
   })
 })

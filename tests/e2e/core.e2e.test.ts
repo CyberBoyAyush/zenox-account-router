@@ -1,3 +1,5 @@
+import { readFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { RouterRpc } from '../../src/rpc.js'
 import type { ProviderID } from '../../src/types.js'
@@ -62,6 +64,18 @@ describe.each(providers)('%s through real OpenCode core', provider => {
     const next = await harness.run(provider, 'still sticky', result.sessionID)
     expect(next.text).toBe('fake success')
     expect(harness.primaries(provider).at(-1)?.authorization).toBe(bearer('cred_b'))
+    // The log tells the whole story: A used, A rejected for quota, failover to B, the session now on B.
+    const engine = harness
+    const logPath = join(dirname(engine.statePath), 'account-router.log')
+    await expect.poll(async () => readFile(logPath, 'utf8')).toMatch(/\| FAILOVER \|/)
+    const log = (await readFile(logPath, 'utf8')).split('\n').map(line => line.split(' | ').slice(1, 5).join(' | '))
+    const story = log.filter(line => / \| (?:USE|QUOTA|FAILOVER) \| /.test(line))
+    expect(story).toEqual([
+      `INFO  | ${provider} | USE | Synthetic cred_a`,
+      `WARN  | ${provider} | QUOTA | Synthetic cred_a`,
+      `INFO  | ${provider} | FAILOVER | Synthetic cred_a → Synthetic cred_b`,
+      `INFO  | ${provider} | USE | Synthetic cred_b`,
+    ])
   }, 60_000)
 
   it('does not switch accounts on a temporary rate limit', async () => {
@@ -329,4 +343,71 @@ describe('openai workspace header consistency under repeated failover', () => {
       harness = undefined
     }
   }, 120_000)
+})
+
+describe.each(providers)('%s smart routing through real OpenCode core', provider => {
+  /** Usage whose 5-hour window resets after `minutes(token)` minutes. */
+  const windows = (minutes: (authorization: string | null) => number) => (call: Parameters<Parameters<Harness['respond']>[0]>[0]) => {
+    if (call.kind !== 'usage') return undefined
+    const reset = Date.now() + minutes(call.authorization) * 60_000
+    const weekly = Date.now() + 5 * 86_400_000
+    return provider === 'anthropic'
+      ? Response.json({ five_hour: { utilization: 14, resets_at: new Date(reset).toISOString() }, seven_day: { utilization: 30, resets_at: new Date(weekly).toISOString() } })
+      : Response.json({ plan_type: 'pro', rate_limit: { allowed: true, limit_reached: false, primary_window: { used_percent: 14, limit_window_seconds: 18_000, reset_at: Math.floor(reset / 1000) }, secondary_window: { used_percent: 30, limit_window_seconds: 604_800, reset_at: Math.floor(weekly / 1000) } } })
+  }
+
+  it('sends the first conversation to the account whose 5-hour allowance expires first, then stays while its cache is warm', async () => {
+    harness = await start({ router: { [provider]: { accountIDs: ['cred_a', 'cred_b'] } }, credentials: { [provider]: [oauth(provider, 'cred_b'), oauth(provider, 'cred_a')] } })
+    expect(await harness.active(provider)).toBe('cred_a')
+    harness.respond(windows(authorization => authorization === bearer('cred_b') ? 102 : 222))
+    const first = await harness.run(provider)
+    expect(first.text).toBe('fake success')
+    // The switch happens at the prompt boundary, so even the very first request uses B.
+    expect(harness.primaries(provider).map(call => call.authorization)).toEqual([bearer('cred_b')])
+    if (provider === 'openai') expect(harness.primaries(provider).map(call => call.workspace)).toEqual(['ws-cred_b'])
+    expect(await harness.active(provider)).toBe('cred_b')
+    expect((await harness.state()).sticky[provider]).toBe('cred_b')
+    // Conversation activity is saved in the background (throttled), for restarts and other OpenCode processes.
+    const engine = harness
+    await expect.poll(async () => (await engine.state()).activity?.[provider] ?? 0).toBeGreaterThan(Date.now() - 60_000)
+    // Now A would expire first, but another conversation just used B: a new thread must not drop that cache.
+    harness.respond(windows(authorization => authorization === bearer('cred_a') ? 10 : 222))
+    const second = await harness.run(provider, 'new thread')
+    const third = await harness.run(provider, 'same thread', first.sessionID)
+    expect([second.text, third.text]).toEqual(['fake success', 'fake success'])
+    expect(harness.primaries(provider).map(call => call.authorization)).toEqual([bearer('cred_b'), bearer('cred_b'), bearer('cred_b')])
+    expect(await harness.active(provider)).toBe('cred_b')
+    const logPath = join(dirname(harness.statePath), 'account-router.log')
+    await expect.poll(async () => readFile(logPath, 'utf8')).toMatch(/WAIT/)
+    const log = await readFile(logPath, 'utf8')
+    expect(log).toMatch(new RegExp(`\\| INFO  \\| ${provider} \\| SWITCH \\| Synthetic cred_a → Synthetic cred_b \\| Synthetic cred_b's 5-hour window resets in 1h 42m, Synthetic cred_a's in 3h 42m`))
+    expect(log).toMatch(new RegExp(`\\| INFO  \\| ${provider} \\| WAIT \\| Synthetic cred_b \\| New session, but a conversation used this account moments ago`))
+    // Which account served each conversation, the detected cache window, and usage checks are all on record.
+    expect(log).toMatch(new RegExp(`\\| ${provider} \\| USE \\| Synthetic cred_b \\| Session ses_\\S+ \\(${MODELS[provider]}\\)\\.`))
+    expect(log).toContain(`| ${provider} | CACHE | - | Prompt cache counts as warm for ${provider === 'anthropic' ? '5m' : '30m'} after a conversation request (${provider === 'anthropic' ? 'Anthropic' : 'OpenAI'} default; OpenCode sends no cache.ttl).`)
+    expect(log).toMatch(new RegExp(`\\| ${provider} \\| USAGE \\| Synthetic cred_a \\| 5-hour 14% \\(resets in 3h 4[12]m\\)`))
+    expect(log).toMatch(/\| router \| LOADED \| - \| Router \S+ started \(strategy smart/)
+    expect(log).not.toMatch(/access-|refresh-/)
+  }, 60_000)
+
+  it('detects a 1-hour cache.ttl from the real OpenCode config and logs it', async () => {
+    harness = await start({
+      router: { [provider]: { accountIDs: ['cred_a', 'cred_b'] } },
+      credentials: { [provider]: [oauth(provider, 'cred_b'), oauth(provider, 'cred_a')] },
+      opencodeConfig: { providers: { [provider]: { settings: { cache: { ttl: '1h' } } } } },
+    })
+    harness.respond(windows(authorization => authorization === bearer('cred_b') ? 102 : 222))
+    expect((await harness.run(provider)).text).toBe('fake success')
+    const logPath = join(dirname(harness.statePath), 'account-router.log')
+    await expect.poll(async () => readFile(logPath, 'utf8')).toContain(`| ${provider} | CACHE | - | Prompt cache counts as warm for 1h 0m after a conversation request (OpenCode cache.ttl setting (1h 0m)).`)
+  }, 60_000)
+
+  it('keeps the active account when the other expires only slightly sooner', async () => {
+    harness = await start({ router: { [provider]: { accountIDs: ['cred_a', 'cred_b'] } }, credentials: { [provider]: [oauth(provider, 'cred_b'), oauth(provider, 'cred_a')] } })
+    harness.respond(windows(authorization => authorization === bearer('cred_b') ? 100 : 120))
+    const result = await harness.run(provider)
+    expect(result.text).toBe('fake success')
+    expect(harness.primaries(provider).map(call => call.authorization)).toEqual([bearer('cred_a')])
+    expect(await harness.active(provider)).toBe('cred_a')
+  }, 60_000)
 })

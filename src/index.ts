@@ -1,18 +1,45 @@
 import type { Plugin } from '@opencode/plugin'
+import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import { createHash } from 'node:crypto'
-import { defaultConfigPath, defaultStatePath, loadConfig, readState, saveState } from './config.js'
+import { appendLog, defaultConfigPath, defaultLogPath, defaultStatePath, loadConfig, readActivity, readSafeText, readState, saveState } from './config.js'
 import { RouterController } from './controller.js'
+import { cleanLabel, duration, formatDecision } from './display.js'
+import { parseCacheTTL } from './policy.js'
 import { buildReport, formatReport } from './report.js'
 import { RouterRpc } from './rpc.js'
 import { PROVIDERS } from './types.js'
-import type { Account, ProviderID, RouterConfig, RouterHost, StoredCredential } from './types.js'
+import type { Account, ProviderID, RouterConfig, RouterDecision, RouterHost, StoredCredential } from './types.js'
+
+function routerVersion(): string {
+  try {
+    const value: unknown = createRequire(import.meta.url)('../package.json')
+    return typeof value === 'object' && value !== null && 'version' in value && typeof value.version === 'string' ? value.version : 'unknown'
+  } catch { return 'unknown' }
+}
+
+/**
+ * A short description of an unexpected error for the log. The message is only kept when it is short plain
+ * prose, so error text that embeds data (JSON, bodies, tokens, prompts with symbols) never reaches the file.
+ */
+export function describeError(error: unknown): string {
+  try {
+    if (!(error instanceof Error)) return 'a non-Error value was thrown'
+    const name = /^[A-Za-z]{1,40}$/.test(error.name) ? error.name : 'Error'
+    const message = typeof error.message === 'string' ? cleanLabel(error.message) : ''
+    return /^[A-Za-z][A-Za-z0-9 ,.'()-]{0,119}$/.test(message) && !/\d{6,}/.test(message) ? `${name}: ${message}` : `${name} (details withheld from the log)`
+  } catch { return 'an unprintable error was thrown' }
+}
 
 interface Pool {
   controller: RouterController
   hosts: Map<symbol, RouterHost>
   timer: ReturnType<typeof setInterval>
   fingerprint: string
+  /** Resolves once queued state writes and decision-log lines are written. */
+  flush: () => Promise<void>
+  log: (decision: Omit<RouterDecision, 'at'>) => void
+  logPath: string
 }
 
 const global = globalThis as typeof globalThis & { __openCodeAccountRouterV1?: Map<string, Pool>; __openCodeAccountRouterCreatingV1?: Map<string, Promise<Pool>> }
@@ -32,18 +59,31 @@ async function acquirePool(configPath: string, statePath: string, config: Router
           if (!value) throw new Error('Router host unavailable.')
           return value
         }
+        const logPath = defaultLogPath(configPath)
+        let logging: Promise<void> = Promise.resolve()
+        const write = (decision: RouterDecision): void => { logging = logging.then(() => appendLog(logPath, formatDecision(decision))).catch(() => undefined) }
         const controller = new RouterController({
           config, state,
           host: {
             listAccounts: () => latestHost().listAccounts(),
             readCredentials: (provider, options) => latestHost().readCredentials(provider, options),
             activate: (provider, accountID) => latestHost().activate(provider, accountID),
+            cacheTTL: async provider => latestHost().cacheTTL?.(provider),
           },
           persist: value => saveState(value, statePath),
+          readActivity: () => readActivity(statePath),
+          // Appends are chained so lines never interleave; a log failure never reaches routing.
+          log: write,
         })
         const timer = setInterval(() => { void controller.tick().catch(() => undefined) }, 30_000)
         timer.unref()
-        const result: Pool = { controller, hosts, timer, fingerprint }
+        const result: Pool = { controller, hosts, timer, fingerprint, flush: async () => { await controller.drain(); await logging }, log: decision => write({ at: Date.now(), ...decision }), logPath }
+        const providers = PROVIDERS.filter(provider => config.providers[provider]).map(provider => {
+          const settings = config.providers[provider]!
+          const names = settings.accountIDs.map(id => cleanLabel(settings.accountLabels?.[id] ?? id)).join(', ')
+          return `${provider}: ${names}; paid fallback ${settings.allowPaidFallback ? `on (${settings.apiKeyModels.join(', ')})` : 'off'}`
+        })
+        result.log({ provider: 'router', event: 'loaded', reason: `Router ${routerVersion()} started (strategy ${config.strategy}, usage checks every ${duration(config.pollIntervalMs)}). ${providers.join(' | ')}. Config ${configPath}.` })
         pools.set(configPath, result)
         return result
       })()
@@ -152,6 +192,23 @@ export function createPluginHost(ctx: Plugin.Context, config: RouterConfig): Rou
       const results = await Promise.allSettled(items.map(({ connection, account }) => account.needsAuth ? Promise.resolve(account) : read(connection, account, options.refresh === true)))
       return results.map((result, index) => result.status === 'fulfilled' ? result.value : { ...items[index]!.account, needsAuth: true })
     },
+    async cacheTTL(provider) {
+      let longest: number | undefined
+      const consider = (settings: unknown): void => {
+        const cache = typeof settings === 'object' && settings !== null && 'cache' in settings ? settings.cache : undefined
+        const ttl = parseCacheTTL(typeof cache === 'object' && cache !== null && 'ttl' in cache ? cache.ttl : undefined)
+        if (ttl !== undefined) longest = Math.max(longest ?? 0, ttl)
+      }
+      try {
+        const result = await within(ctx.provider.get({ providerID: provider }), RESOLVE_TIMEOUT_MS)
+        if (result !== TIMED_OUT) consider(result.data.settings)
+      } catch { /* Unknown provider settings fall back to the default window. */ }
+      try {
+        const result = await within(ctx.model.list(), RESOLVE_TIMEOUT_MS)
+        if (result !== TIMED_OUT) for (const model of result.data) if (model.providerID === provider) consider(model.settings)
+      } catch { /* Same. */ }
+      return longest
+    },
     async activate(provider, accountID) {
       const accounts = await listAccounts()
       if (!accounts.some(account => account.provider === provider && account.id === accountID && !account.needsAuth)) throw new Error('Router account is unavailable.')
@@ -209,8 +266,14 @@ function controlled(config: RouterConfig, id: string): id is 'anthropic' | 'open
 export const accountRouter: Plugin.Plugin = {
   id: 'zenox.account-router',
   async setup(ctx) {
-    if (!/^2\.(?:[3-9]|[1-9]\d+)\./.test(ctx.app.version) && !/^2\.2\.(?:[5-9]|[1-9]\d+)(?:\D|$)/.test(ctx.app.version)) throw new Error('Account router requires OpenCode V2 2.2.5 or newer.')
     const configPath = typeof ctx.options.configPath === 'string' ? resolve(ctx.options.configPath) : defaultConfigPath()
+    if (!/^2\.(?:[3-9]|[1-9]\d+)\./.test(ctx.app.version) && !/^2\.2\.(?:[5-9]|[1-9]\d+)(?:\D|$)/.test(ctx.app.version)) {
+      // Leave a trace for users who configured the router, so an app bundling an older OpenCode is easy to spot.
+      try {
+        if (await readSafeText(configPath) !== null) await appendLog(defaultLogPath(configPath), formatDecision({ at: Date.now(), provider: 'router', event: 'load-failed', level: 'error', reason: `Not loaded: this OpenCode is ${cleanLabel(ctx.app.version).slice(0, 40)}, the router needs 2.2.5 or newer. Requests from this OpenCode are not routed or seen by the router.` }))
+      } catch { /* Never block OpenCode on logging. */ }
+      throw new Error('Account router requires OpenCode V2 2.2.5 or newer.')
+    }
     const config = await loadConfig(configPath)
     if (!config || !Object.keys(config.providers).length) return
     const statePath = defaultStatePath(configPath)
@@ -222,7 +285,10 @@ export const accountRouter: Plugin.Plugin = {
     pool.hosts.set(token, host)
     const { controller } = pool
     const registrations: { dispose(): Promise<void> }[] = []
-    const safely = async (operation: () => Promise<unknown>): Promise<void> => { try { await operation() } catch { /* Keep provider errors authoritative; never print credential diagnostics. */ } }
+    // Keep provider errors authoritative: a router failure is logged and never breaks the request.
+    const safely = (hook: string) => async (operation: () => Promise<unknown>): Promise<void> => {
+      try { await operation() } catch (error) { pool.log({ provider: 'router', event: 'error', level: 'error', reason: `${hook} hook failed and was skipped: ${describeError(error)}` }) }
+    }
     try {
       registrations.push(await ctx.provider.transform(editor => {
         for (const provider of PROVIDERS) if (config.providers[provider]) editor.update(provider, value => { value.settings = { ...value.settings, transport: 'http' } })
@@ -230,16 +296,18 @@ export const accountRouter: Plugin.Plugin = {
       registrations.push(await ctx.model.transform(editor => {
         for (const provider of PROVIDERS) if (config.providers[provider]) for (const model of editor.list(provider)) editor.update(provider, model.id, value => { value.settings = { ...value.settings, transport: 'http' } })
       }))
-      registrations.push(await ctx.session.hook('prompt', event => safely(async () => {
+      registrations.push(await ctx.session.hook('prompt', event => safely('prompt')(async () => {
         const session = await ctx.session.get({ sessionID: event.sessionID })
         if (session.model && controlled(config, session.model.providerID)) {
           await controller.initialize(session.model.providerID)
           await controller.reclaim(session.model.providerID)
+          // Every prompt is a chance to move to the best account; it only happens when no prompt cache would be lost.
+          await controller.rebalance(session.model.providerID, event.sessionID)
         }
       })))
-      registrations.push(await ctx.session.hook('http.request', event => safely(() => controller.onRequest(event, event.request))))
-      registrations.push(await ctx.session.hook('http.response', event => safely(() => controller.onResponse(event, event.request, event.response))))
-      registrations.push(await ctx.session.hook('retry', event => safely(() => controller.onRetry(event))))
+      registrations.push(await ctx.session.hook('http.request', event => safely('http.request')(() => controller.onRequest(event, event.request))))
+      registrations.push(await ctx.session.hook('http.response', event => safely('http.response')(() => controller.onResponse(event, event.request, event.response))))
+      registrations.push(await ctx.session.hook('retry', event => safely('retry')(() => controller.onRetry(event))))
       // The terminal UI part calls this to render `/router-status`; it never sends inference or switches accounts.
       registrations.push(await ctx.rpc.register(RouterRpc, {
         status: async input => {
@@ -248,20 +316,21 @@ export const accountRouter: Plugin.Plugin = {
           if (refresh) await within(Promise.all(PROVIDERS.filter(provider => config.providers[provider]).map(provider => controller.refresh(provider))), 8_000)
           let accounts: Account[] | undefined
           try { accounts = await host.listAccounts() } catch { accounts = undefined }
-          const report = buildReport(config, controller.state, { now: Date.now(), accounts, live: true })
+          const cacheWindows = Object.fromEntries(PROVIDERS.filter(provider => config.providers[provider]).map(provider => [provider, controller.cacheWindow(provider).ms]))
+          const report = buildReport(config, controller.state, { now: Date.now(), accounts, live: true, cacheWindows, logPath: pool.logPath })
           return { text: formatReport(report), report }
         },
       }))
     } catch (error) {
       await Promise.all(registrations.map(registration => registration.dispose()))
       pool.hosts.delete(token)
-      if (!pool.hosts.size) { clearInterval(pool.timer); controller.stop(); if (pools.get(configPath) === pool) pools.delete(configPath) }
+      if (!pool.hosts.size) { clearInterval(pool.timer); controller.stop(); if (pools.get(configPath) === pool) pools.delete(configPath); pool.log({ provider: 'router', event: 'unloaded', reason: 'Router stopped (OpenCode closed or reloaded).' }); await pool.flush() }
       throw error
     }
     return async () => {
       await Promise.all(registrations.map(registration => registration.dispose()))
       pool.hosts.delete(token)
-      if (!pool.hosts.size) { clearInterval(pool.timer); controller.stop(); if (pools.get(configPath) === pool) pools.delete(configPath) }
+      if (!pool.hosts.size) { clearInterval(pool.timer); controller.stop(); if (pools.get(configPath) === pool) pools.delete(configPath); pool.log({ provider: 'router', event: 'unloaded', reason: 'Router stopped (OpenCode closed or reloaded).' }); await pool.flush() }
     }
   },
 }

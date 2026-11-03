@@ -62,10 +62,22 @@ export interface ProviderConfig {
   apiKeyModels: string[]
 }
 
+/**
+ * `smart` also moves to the account whose allowance expires soonest, but only at a cache-safe moment.
+ * `sticky` only ever switches when the active account runs out.
+ */
+export type RoutingStrategy = 'smart' | 'sticky'
+
 export interface RouterConfig {
   version: 1
   pollIntervalMs: number
   idleTimeoutMs: number
+  strategy: RoutingStrategy
+  /**
+   * Override for how long a prompt cache stays warm after its last request; smart switches wait this long.
+   * Unset: OpenCode's configured `cache.ttl`, else the provider default (Anthropic 5 minutes, OpenAI 30 minutes).
+   */
+  cacheWindowMs?: number
   providers: Partial<Record<ProviderID, ProviderConfig>>
 }
 
@@ -80,6 +92,24 @@ export interface RouterState {
   usage: Record<string, UsageSnapshot>
   cooldowns: Record<string, Cooldown>
   sticky: Partial<Record<ProviderID, string>>
+  /** Last conversation request per provider, so a restart or another OpenCode process keeps warm caches. */
+  activity?: Partial<Record<ProviderID, number>>
+}
+
+export type RouterEvent =
+  | 'loaded' | 'load-failed' | 'unloaded' | 'cache' | 'start' | 'pause'
+  | 'use' | 'usage' | 'quota' | 'ignored' | 'failover' | 'no-switch'
+  | 'switch' | 'keep' | 'wait' | 'reclaim' | 'error'
+
+/** One decision-log entry. Never holds credentials; labels and reasons are human-readable. */
+export interface RouterDecision {
+  at: number
+  provider: ProviderID | 'router'
+  event: RouterEvent
+  level?: 'info' | 'warn' | 'error'
+  from?: string
+  to?: string
+  reason: string
 }
 
 export interface ReadOptions {
@@ -96,4 +126,6 @@ export interface CredentialSource {
 export interface RouterHost extends CredentialSource {
   /** Resolves `false` when the host could not confirm the switch fully applied (retry should wait). */
   activate(provider: ProviderID, accountID: string): Promise<boolean | void>
+  /** Longest prompt-cache lifetime OpenCode is configured to request for this provider (`cache.ttl`), in ms. */
+  cacheTTL?(provider: ProviderID): Promise<number | undefined>
 }

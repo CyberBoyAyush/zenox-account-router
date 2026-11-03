@@ -171,6 +171,8 @@ function context(path: string, provider: ProviderID = 'anthropic', values = cred
     app: { version: '2.2.5' }, options: { configPath: path }, integration: { get, connection: { resolve } }, credential: { activate },
     session: { hook, get: sessionGet, synthetic }, provider: { transform: providerTransform, get: providerGet }, model: { transform: modelTransform }, command: { transform: commandTransform }, rpc: { register: rpcRegister },
   } as unknown as Plugin.Context
+  // The router reads provider settings once at startup (cache TTL); the rest are OpenAI activation-settle checks.
+  const settleCalls = (): number => Math.max(0, providerGet.mock.calls.length - 1)
   const resolvedIDs = (): string[] => resolve.mock.calls.map(([connection]) => connection.type === 'credential' ? connection.id : connection.type)
   async function emit<Name extends HookName>(name: Name, event: SessionHooks[Name]): Promise<void> {
     const callback = hooks.get(name) as Handler<Name> | undefined
@@ -190,7 +192,7 @@ function context(path: string, provider: ProviderID = 'anthropic', values = cred
     }
     return undefined
   }
-  return { ctx, connections, hooks, hookOptions, registrations, commands, rpc, rpcRegister, providerTransforms, modelTransforms, get, activate, synthetic, sessionGet, resolve, resolvedIDs, providerGet, activeHeaders, values, emit, prompt, setup }
+  return { ctx, connections, hooks, hookOptions, registrations, commands, rpc, rpcRegister, providerTransforms, modelTransforms, get, activate, synthetic, sessionGet, resolve, resolvedIDs, providerGet, settleCalls, activeHeaders, values, emit, prompt, setup }
 }
 
 function usageFetch() {
@@ -285,6 +287,16 @@ describe('real Plugin.define account-router setup', () => {
     expect(f.registrations).toHaveLength(0)
     expect(f.get).not.toHaveBeenCalled()
     expect(f.resolve).not.toHaveBeenCalled()
+    // A configured user gets a trace explaining why this OpenCode is not routed (for example an app bundling an old engine).
+    const log = await readFile(String(f.ctx.options.configPath).replace(/\.json$/u, '.log'), 'utf8')
+    expect(log).toMatch(new RegExp(`\\| ERROR \\| router \\| LOAD-FAILED \\| - \\| Not loaded: this OpenCode is ${version.replace(/\./gu, '\\.')}, the router needs 2\\.2\\.5 or newer\\.`))
+  })
+
+  it('writes no log for an unsupported OpenCode when the router was never configured', async () => {
+    const path = await configFile()
+    const f = context(path)
+    await expect(accountRouter.setup({ ...f.ctx, app: { ...f.ctx.app, version: '2.1.0' } })).rejects.toThrow('2.2.5 or newer')
+    await expect(stat(path.replace(/\.json$/u, '.log'))).rejects.toThrow()
   })
 
   it.each(['2.2.5', '2.2.15', '2.3.0'])('accepts supported version %s', async version => {
@@ -378,7 +390,8 @@ describe.each(providers)('%s companion hooks with actual credential matching', p
     expect(input.decision).toEqual({ retry: true, delay: 0 })
     expect(f.activate.mock.calls.map(([input]) => input.credentialID)).toEqual(['b'])
     // OpenAI activation settles on the rebuilt workspace header (already B here); Anthropic never polls.
-    expect(f.providerGet).toHaveBeenCalledTimes(provider === 'openai' ? 1 : 0)
+    expect(f.providerGet).toHaveBeenNthCalledWith(1, { providerID: provider })
+    expect(f.settleCalls()).toBe(provider === 'openai' ? 1 : 0)
   })
 
   it('does not correlate a response to a different, byte-identical Request object', async () => {
@@ -419,7 +432,7 @@ describe.each(providers)('%s companion hooks with actual credential matching', p
     expect(f.activate.mock.calls.map(([input]) => input.credentialID)).toEqual(mode === 'allowed' ? ['b', 'key'] : ['b'])
     expect(f.resolvedIDs()).not.toContain('outside')
     expect(f.resolvedIDs().includes('key')).toBe(mode !== 'disabled')
-    expect(f.providerGet).toHaveBeenCalledTimes(provider === 'openai' ? f.activate.mock.calls.length : 0)
+    expect(f.settleCalls()).toBe(provider === 'openai' ? f.activate.mock.calls.length : 0)
     if (mode !== 'allowed') return
     // Construct the hypothetical next core request ourselves; this does not test a core rebuild.
     const paid = request(provider, f.values[2]!)
@@ -722,7 +735,7 @@ describe('createPluginHost credentials through OpenCode integrations', () => {
     const result = await reject(f, provider, f.values[0]!)
     expect(result.input.decision).toEqual({ retry: false })
     expect(f.activate).not.toHaveBeenCalled()
-    expect(f.providerGet).not.toHaveBeenCalled()
+    expect(f.settleCalls()).toBe(0)
   })
 })
 
@@ -882,5 +895,106 @@ describe('createPluginHost refresh discipline', () => {
     expect(f.activate).not.toHaveBeenCalled()
     expect(f.resolve).not.toHaveBeenCalled()
     expect(monitor).not.toHaveBeenCalled()
+  })
+})
+
+describe.each(providers)('%s smart routing through the plugin hooks', provider => {
+  /** A's 5-hour window resets in 3h42m, B's in 1h42m (the B allowance expires first). */
+  function smartUsage() {
+    const fetch = vi.fn<typeof globalThis.fetch>(async (input, init) => {
+      const auth = new Headers(init?.headers).get('authorization') ?? ''
+      const reset = Date.now() + (auth.endsWith('-b') ? 6_120_000 : 13_320_000)
+      const weekly = Date.now() + 400_000_000
+      if (String(input) === 'https://api.anthropic.com/api/oauth/usage') return Response.json({ five_hour: { utilization: 14, resets_at: new Date(reset).toISOString() }, seven_day: { utilization: 30, resets_at: new Date(weekly).toISOString() } })
+      return Response.json({ rate_limit: { allowed: true, primary_window: { used_percent: 14, limit_window_seconds: 18_000, reset_at: reset / 1000 }, secondary_window: { used_percent: 30, limit_window_seconds: 604_800, reset_at: weekly / 1000 } } })
+    })
+    vi.stubGlobal('fetch', fetch)
+    return fetch
+  }
+
+  it('a quiet prompt moves to the account whose allowance expires first, before its requests are built, and logs why', async () => {
+    smartUsage()
+    const path = await configFile(config(provider))
+    const f = context(path, provider)
+    const dispose = await f.setup()
+    await f.prompt()
+    expect(f.activate.mock.calls.map(([input]) => input.credentialID)).toEqual(['b'])
+    expect(f.connections.get(provider)![0]).toMatchObject({ id: 'b' })
+    const state = JSON.parse(await readFile(defaultStatePath(path), 'utf8')) as RouterState
+    expect(state.sticky[provider]).toBe('b')
+    await f.emit('http.request', { ...scope(provider), request: request(provider, f.values.find(value => value.id === 'b')!) })
+    await dispose?.()
+    const logPath = path.replace(/\.json$/u, '.log')
+    const log = (await readFile(logPath, 'utf8')).split('\n').filter(Boolean)
+    expect((await stat(logPath)).mode & 0o777).toBe(0o600)
+    // Every line: local time | level | scope | event | accounts | message.
+    expect(log.every(line => /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3} [+-]\d\d:\d\d \| (?:INFO |WARN |ERROR) \| (?:router|anthropic|openai) \| [A-Z-]+ \| .+ \| .+$/.test(line))).toBe(true)
+    const events = log.map(line => line.split(' | ').slice(2, 5).join(' | '))
+    expect(events).toEqual([
+      'router | LOADED | -',
+      `${provider} | CACHE | -`,
+      `${provider} | USAGE | Synthetic a`,
+      `${provider} | USAGE | Synthetic b`,
+      `${provider} | START | Synthetic a`,
+      `${provider} | SWITCH | Synthetic a → Synthetic b`,
+      `${provider} | USE | Synthetic b`,
+      'router | UNLOADED | -',
+    ])
+    expect(log[0]).toMatch(/Router \d+\.\d+\.\d+\S* started \(strategy smart, usage checks every 10m\)\. .*Synthetic a, Synthetic b|Router \d+\.\d+\.\d+\S* started \(strategy smart, usage checks every 10m\)\. .*a, b/)
+    expect(log[1]).toContain(`Prompt cache counts as warm for ${provider === 'anthropic' ? '5m' : '30m'} after a conversation request`)
+    expect(log[5]).toContain("Synthetic b's 5-hour window resets in 1h 42m, Synthetic a's in 3h 42m")
+    expect(log[6]).toContain('Session session-synthetic (model).')
+    expect(log.join('\n')).not.toMatch(/synthetic-(anthropic|openai)-|synthetic-refresh|Bearer/)
+  })
+
+  it('does not switch on a prompt while a conversation request went out moments ago', async () => {
+    smartUsage()
+    const f = context(await configFile(config(provider)), provider)
+    await f.setup()
+    // Initialize first with identical windows, then traffic, then a new prompt.
+    await f.emit('http.request', { ...scope(provider), request: request(provider, f.values[0]!) })
+    await f.prompt()
+    expect(f.activate).not.toHaveBeenCalled()
+    vi.setSystemTime(epoch + (provider === 'anthropic' ? 300_000 : 1_800_000) - 1)
+    await f.prompt()
+    expect(f.activate).not.toHaveBeenCalled()
+    vi.setSystemTime(epoch + (provider === 'anthropic' ? 300_000 : 1_800_000))
+    await f.prompt()
+    expect(f.activate.mock.calls.map(([input]) => input.credentialID)).toEqual(['b'])
+  })
+
+  it('picks up a 1-hour cache.ttl from OpenCode provider settings and waits that long', async () => {
+    smartUsage()
+    const f = context(await configFile(config(provider)), provider)
+    f.providerGet.mockImplementation(async () => ({ data: { headers: f.activeHeaders(), settings: { baseURL: CODEX, cache: { ttl: '1h' } } } }) as unknown as ProviderResult)
+    await f.setup()
+    await f.emit('http.request', { ...scope(provider), request: request(provider, f.values[0]!) })
+    await f.prompt()
+    vi.setSystemTime(epoch + 3_599_999)
+    await f.prompt()
+    expect(f.activate).not.toHaveBeenCalled()
+    vi.setSystemTime(epoch + 3_600_000)
+    await f.prompt()
+    expect(f.activate.mock.calls.map(([input]) => input.credentialID)).toEqual(['b'])
+  })
+
+  it('logs a hook failure instead of breaking the request', async () => {
+    smartUsage()
+    const path = await configFile(config(provider))
+    const f = context(path, provider)
+    const dispose = await f.setup()
+    f.sessionGet.mockRejectedValueOnce(new Error('session store unavailable'))
+    await expect(f.prompt()).resolves.toBeUndefined()
+    await dispose?.()
+    const log = await readFile(path.replace(/\.json$/u, '.log'), 'utf8')
+    expect(log).toMatch(/\| ERROR \| router \| ERROR \| - \| prompt hook failed and was skipped: Error: session store unavailable/)
+  })
+
+  it('sticky strategy keeps the old behaviour: no switch at prompts', async () => {
+    smartUsage()
+    const f = context(await configFile({ ...config(provider), strategy: 'sticky' }), provider)
+    await f.setup()
+    await f.prompt()
+    expect(f.activate).not.toHaveBeenCalled()
   })
 })

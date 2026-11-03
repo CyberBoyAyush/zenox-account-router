@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { emptyState, parseConfig } from '../src/config.js'
 import { RouterController } from '../src/controller.js'
+import { DEFAULT_CACHE_WINDOW_MS } from '../src/policy.js'
 import type { RequestScope, RetryInput } from '../src/controller.js'
-import type { Account, Fetch, ProviderConfig, ProviderID, RouterHost, RouterState, StoredCredential, UsageSnapshot } from '../src/types.js'
+import type { Account, Fetch, ProviderConfig, ProviderID, RouterDecision, RouterHost, RouterState, RoutingStrategy, StoredCredential, UsageSnapshot } from '../src/types.js'
 
 const epoch = Date.parse('2026-11-02T12:00:00Z')
 const interval = 600_000
@@ -30,10 +31,11 @@ function quota(provider: ProviderID, now: number): { body: string; headers: Head
     : { body: JSON.stringify({ error: { type: 'usage_limit_reached', resets_at: (now + 3_600_000) / 1000 } }), headers: { 'x-codex-active-limit': 'codex' } }
 }
 
-function fixture(provider: ProviderID, options: { settings?: Partial<ProviderConfig>; state?: RouterState; cold?: boolean; idleTimeoutMs?: number; pollIntervalMs?: number } = {}) {
+function fixture(provider: ProviderID, options: { settings?: Partial<ProviderConfig>; state?: RouterState; cold?: boolean; idleTimeoutMs?: number; pollIntervalMs?: number; strategy?: RoutingStrategy; cacheWindowMs?: number; readActivity?: () => Promise<RouterState['activity']>; cacheTTL?: RouterHost['cacheTTL'] } = {}) {
   let now = epoch
   const settings: ProviderConfig = { accountIDs: ['a', 'b'], allowPaidFallback: true, apiKeyAccountID: 'key', apiKeyModels: ['model'], ...options.settings }
-  const config = parseConfig({ version: 1, pollIntervalMs: options.pollIntervalMs ?? interval, idleTimeoutMs: options.idleTimeoutMs ?? interval, providers: { [provider]: settings } })
+  const config = parseConfig({ version: 1, pollIntervalMs: options.pollIntervalMs ?? interval, idleTimeoutMs: options.idleTimeoutMs ?? interval, ...(options.strategy ? { strategy: options.strategy } : {}), ...(options.cacheWindowMs ? { cacheWindowMs: options.cacheWindowMs } : {}), providers: { [provider]: settings } })
+  const decisions: RouterDecision[] = []
   const credentials = [...settings.accountIDs.map(id => credential(provider, id)), credential(provider, 'key'), credential(provider, 'outside', { active: false })]
   const accounts: Account[] = credentials.map(({ id, provider, label, method, active, needsAuth }) => ({ id, provider, label, method, active, ...(needsAuth ? { needsAuth } : {}) }))
   const state = options.state ?? emptyState()
@@ -52,7 +54,7 @@ function fixture(provider: ProviderID, options: { settings?: Partial<ProviderCon
   const readCredentials = vi.fn<RouterHost['readCredentials']>(async target => structuredClone(credentials.filter(value => value.provider === target)))
   const listAccounts = vi.fn<RouterHost['listAccounts']>(async () => structuredClone(accounts))
   const persist = vi.fn<(value: RouterState) => Promise<void>>(async () => {})
-  const controller = new RouterController({ config, state, host: { activate, readCredentials, listAccounts }, fetch, now: () => now, persist })
+  const controller = new RouterController({ config, state, host: { activate, readCredentials, listAccounts, ...(options.cacheTTL ? { cacheTTL: options.cacheTTL } : {}) }, fetch, now: () => now, persist, log: decision => { decisions.push(decision) }, ...(options.readActivity ? { readActivity: options.readActivity } : {}) })
   controllers.push(controller)
   const scope: RequestScope = { sessionID: 'session', agent: 'build', model: { providerID: provider, id: 'model' }, kind: 'primary' }
   function request(id = 'a', headers?: HeadersInit): Request {
@@ -77,7 +79,7 @@ function fixture(provider: ProviderID, options: { settings?: Partial<ProviderCon
     await controller.onResponse(usedScope, outgoing, response)
     return { response, request: outgoing, input: retry(body, { sessionID: usedScope.sessionID, agent: usedScope.agent, model: usedScope.model, attempt: options.attempt ?? 1, error: { type: 'provider.quota', message: 'Synthetic quota rejection', status, response: { body } } }) }
   }
-  return { provider, config, settings, state, accounts, credentials, controller, fetch, activate, persist, readCredentials, listAccounts, scope, request, retry, reject, now: () => now, advance: (milliseconds: number) => { now += milliseconds }, setMonitor: (value: typeof monitor) => { monitor = value }, setActive: (id: string) => { for (const account of accounts) account.active = account.id === id } }
+  return { provider, config, settings, state, accounts, credentials, controller, fetch, activate, persist, readCredentials, listAccounts, scope, request, retry, reject, decisions, now: () => now, advance: (milliseconds: number) => { now += milliseconds }, setMonitor: (value: typeof monitor) => { monitor = value }, setActive: (id: string) => { for (const account of accounts) account.active = account.id === id } }
 }
 
 describe('upstream Anthropic diagnostic corroboration', () => {
@@ -657,7 +659,9 @@ describe.each(providers)('%s quota-driven routing with actual provider adapters'
       if (value.key) expect(serialized).not.toContain(value.key)
     }
     for (const forbidden of ['workspace-', 'Authorization', 'Bearer ', 'Weekly usage limit reached', 'usage_limit_reached', 'metadata', 'messages']) expect(serialized).not.toContain(forbidden)
-    expect(f.persist.mock.calls.every(([state]) => Object.keys(state).sort().join(',') === 'cooldowns,sticky,usage,version')).toBe(true)
+    expect(f.persist.mock.calls.every(([state]) => ['activity,cooldowns,sticky,usage,version', 'cooldowns,sticky,usage,version'].includes(Object.keys(state).sort().join(',')))).toBe(true)
+    // Activity is only a per-provider timestamp.
+    expect(f.persist.mock.calls.every(([state]) => Object.entries(state.activity ?? {}).every(([key, value]) => key === provider && typeof value === 'number'))).toBe(true)
   })
 })
 
@@ -815,5 +819,463 @@ describe.each(providers)('%s credential read discipline under unattributable tra
     const { input } = await f.reject()
     expect(await f.controller.onRetry(input)).toBe(true)
     expect(input.decision).toEqual({ retry: true, delay: 3_000 })
+  })
+})
+
+type Fixture = ReturnType<typeof fixture>
+type Windows = { session: number | null; weekly?: number | null; used?: number; weeklyUsed?: number }
+
+/** Usage per account (by bearer token): 5-hour and weekly resets as offsets from the fixture's clock. */
+function usageBy(f: Fixture, plan: Record<string, Windows>): (headers: Headers) => Response {
+  return headers => {
+    const auth = headers.get('authorization') ?? ''
+    const entry = Object.entries(plan).find(([id]) => auth.endsWith(`-${id}-secret`))?.[1] ?? { session: 18_000_000 }
+    const now = f.now()
+    const used = entry.used ?? 20
+    const weeklyUsed = entry.weeklyUsed ?? 30
+    const session = entry.session === null ? null : now + entry.session
+    const weekly = entry.weekly === null ? null : now + (entry.weekly ?? 604_800_000)
+    const body = f.provider === 'anthropic'
+      ? { five_hour: { utilization: entry.session === null ? 0 : used, resets_at: session === null ? null : new Date(session).toISOString() }, seven_day: { utilization: weeklyUsed, resets_at: weekly === null ? null : new Date(weekly).toISOString() } }
+      : { rate_limit: { allowed: used < 100 && weeklyUsed < 100, primary_window: { used_percent: entry.session === null ? 0 : used, limit_window_seconds: 18_000, reset_at: session === null ? null : session / 1000 }, secondary_window: { used_percent: weeklyUsed, limit_window_seconds: 604_800, reset_at: weekly === null ? null : weekly / 1000 } } }
+    return new Response(JSON.stringify(body))
+  }
+}
+
+const hours = (value: number): number => value * 3_600_000
+const minutes = (value: number): number => value * 60_000
+// The user's real numbers: the active account's 5-hour window resets in 3h42m, the standby's in 1h42m.
+const userCase = { a: { session: hours(3) + minutes(42), weekly: hours(116) }, b: { session: hours(1) + minutes(42), weekly: hours(95) } }
+
+function scopeFor(f: Fixture, sessionID: string, kind: RequestScope['kind'] = 'primary'): RequestScope {
+  return { ...f.scope, sessionID, kind }
+}
+
+async function converse(f: Fixture, sessionID = 'busy', kind: RequestScope['kind'] = 'primary', id = 'a'): Promise<void> {
+  const scope = scopeFor(f, sessionID, kind)
+  const outgoing = f.request(id)
+  await f.controller.onRequest(scope, outgoing)
+  await f.controller.onResponse(scope, outgoing, new Response('{}', { status: 200 }))
+}
+
+describe.each(providers)('%s smart routing at cache-safe prompts', provider => {
+  // Anthropic's default prompt cache lasts 5 minutes, OpenAI's 30 minutes.
+  const cache = DEFAULT_CACHE_WINDOW_MS[provider]
+  async function started(options: Parameters<typeof fixture>[1] = {}, plan: Record<string, Windows> = userCase) {
+    const f = fixture(provider, { cold: true, ...options })
+    f.setMonitor(usageBy(f, plan))
+    await f.controller.initialize(provider)
+    return f
+  }
+
+  it('moves a new conversation after a quiet period to the account whose 5-hour allowance expires first', async () => {
+    const f = await started()
+    expect(f.activate).not.toHaveBeenCalled()
+    await f.controller.rebalance(provider, 'new-thread')
+    expect(f.activate.mock.calls).toEqual([[provider, 'b']])
+    expect(f.state.sticky[provider]).toBe('b')
+    const decision = f.decisions.find(item => item.event === 'switch')
+    expect(decision).toMatchObject({ provider, from: 'Synthetic a', to: 'Synthetic b' })
+    expect(decision?.reason).toBe("Synthetic b's 5-hour window resets in 1h 42m, Synthetic a's in 3h 42m; use the allowance that expires first.")
+    expect(f.persist).toHaveBeenLastCalledWith(expect.objectContaining({ sticky: { [provider]: 'b' } }))
+  })
+
+  it('also checks an existing conversation that resumes after its cache expired', async () => {
+    const f = await started()
+    await f.controller.rebalance(provider, 'thread')
+    expect(f.activate).toHaveBeenCalledTimes(1)
+    await converse(f, 'thread', 'primary', 'b')
+    // The other account's window comes back around and now expires first.
+    f.setMonitor(usageBy(f, { a: { session: minutes(40) }, b: { session: hours(4) } }))
+    f.advance(Math.max(interval, cache) + 1)
+    await f.controller.rebalance(provider, 'thread')
+    expect(f.activate.mock.calls.map(call => call[1])).toEqual(['b', 'a'])
+    expect(f.decisions.filter(item => item.event === 'switch').map(item => item.to)).toEqual(['Synthetic b', 'Synthetic a'])
+  })
+
+  it('waits while another conversation has a warm prompt cache, then switches once it has gone quiet', async () => {
+    const f = await started()
+    await converse(f)
+    f.advance(cache - minutes(1))
+    await f.controller.rebalance(provider, 'new-thread')
+    expect(f.activate).not.toHaveBeenCalled()
+    expect(f.decisions.at(-1)).toMatchObject({ event: 'wait', from: 'Synthetic a' })
+    expect(f.decisions.at(-1)?.reason).toContain(`${(cache - minutes(1)) / 60_000}m ago`)
+    // Later prompts of the same session are not logged again while waiting.
+    await f.controller.rebalance(provider, 'new-thread')
+    expect(f.decisions.filter(item => item.event === 'wait')).toHaveLength(1)
+    f.advance(minutes(1) - 1)
+    await f.controller.rebalance(provider, 'new-thread')
+    expect(f.activate).not.toHaveBeenCalled()
+    f.advance(1)
+    await f.controller.rebalance(provider, 'new-thread')
+    expect(f.activate.mock.calls).toEqual([[provider, 'b']])
+  })
+
+  it('counts compaction and session generation (OpenCode cache warming) as cache traffic, but not title requests', async () => {
+    for (const kind of ['compaction', 'generate'] as const) {
+      const warm = await started()
+      await converse(warm, 'other', kind)
+      await warm.controller.rebalance(provider, 'new')
+      expect(warm.activate, kind).not.toHaveBeenCalled()
+    }
+    const f = await started()
+    await converse(f, 'other', 'title')
+    await f.controller.rebalance(provider, 'new')
+    expect(f.activate).toHaveBeenCalledWith(provider, 'b')
+  })
+
+  it('honours a configured longer cache window (for example a 1-hour prompt cache)', async () => {
+    const f = await started({ cacheWindowMs: hours(1) })
+    await converse(f)
+    f.advance(minutes(30))
+    await f.controller.rebalance(provider, 'new')
+    expect(f.activate).not.toHaveBeenCalled()
+    f.advance(minutes(30))
+    await f.controller.rebalance(provider, 'new')
+    expect(f.activate).toHaveBeenCalledWith(provider, 'b')
+  })
+
+  it('keeps the active account when the other expires less than 30 minutes sooner, and says why', async () => {
+    const f = await started({}, { a: { session: hours(2) }, b: { session: hours(2) - minutes(29) } })
+    await f.controller.rebalance(provider, 'new')
+    expect(f.activate).not.toHaveBeenCalled()
+    expect(f.decisions.at(-1)).toMatchObject({ event: 'keep', from: 'Synthetic a' })
+    const g = await started({}, { a: { session: hours(2) }, b: { session: hours(2) - minutes(30) } })
+    await g.controller.rebalance(provider, 'new')
+    expect(g.activate).toHaveBeenCalledWith(provider, 'b')
+  })
+
+  it('keeps the active account when its own allowance expires first', async () => {
+    const f = await started({}, { a: { session: hours(1) }, b: { session: hours(4) } })
+    await f.controller.rebalance(provider, 'new')
+    expect(f.activate).not.toHaveBeenCalled()
+    expect(f.decisions.at(-1)?.reason).toContain("Synthetic a's 5-hour window resets first")
+  })
+
+  it('prefers a running 5-hour window over starting a fresh one', async () => {
+    const f = await started({}, { a: { session: null }, b: { session: hours(4) } })
+    await f.controller.rebalance(provider, 'new')
+    expect(f.activate).toHaveBeenCalledWith(provider, 'b')
+    const g = await started({}, { a: { session: hours(4) }, b: { session: null } })
+    await g.controller.rebalance(provider, 'new')
+    expect(g.activate).not.toHaveBeenCalled()
+  })
+
+  it('uses the weekly reset when neither 5-hour window is running', async () => {
+    const f = await started({}, { a: { session: null, weekly: hours(100) }, b: { session: null, weekly: hours(80) } })
+    await f.controller.rebalance(provider, 'new')
+    expect(f.activate).toHaveBeenCalledWith(provider, 'b')
+    const g = await started({}, { a: { session: null, weekly: hours(100) }, b: { session: null, weekly: hours(90) } })
+    await g.controller.rebalance(provider, 'new')
+    expect(g.activate).not.toHaveBeenCalled()
+  })
+
+  it('never moves to an account that is out of allowance or nearly out', async () => {
+    for (const b of [{ session: minutes(10), used: 100 }, { session: minutes(10), used: 96 }, { session: minutes(10), weeklyUsed: 100 }]) {
+      const f = await started({}, { a: { session: hours(4) }, b })
+      await f.controller.rebalance(provider, 'new')
+      expect(f.activate, JSON.stringify(b)).not.toHaveBeenCalled()
+    }
+  })
+
+  it('moves off an exhausted active account even while a conversation is warm, since its cache is unusable anyway', async () => {
+    const f = await started({}, { a: { session: hours(4), used: 100 }, b: { session: hours(4) } })
+    await converse(f)
+    await f.controller.rebalance(provider, 'new')
+    expect(f.activate).toHaveBeenCalledWith(provider, 'b')
+    expect(f.decisions.at(-1)?.reason).toBe('Synthetic a is out of allowance.')
+  })
+
+  it('moves off an active account with a confirmed cooldown', async () => {
+    const f = await started({}, { a: { session: hours(4) }, b: { session: hours(4) } })
+    f.state.cooldowns[`${provider}:a`] = { until: f.now() + hours(1), confirmedAt: f.now() }
+    await converse(f)
+    await f.controller.rebalance(provider, 'new')
+    expect(f.activate).toHaveBeenCalledWith(provider, 'b')
+  })
+
+  it('moves off an active account with less than 5% left once quiet', async () => {
+    const f = await started({}, { a: { session: hours(4), used: 96 }, b: { session: hours(4) } })
+    await f.controller.rebalance(provider, 'new')
+    expect(f.activate).toHaveBeenCalledWith(provider, 'b')
+    expect(f.decisions.at(-1)?.reason).toBe('Synthetic a has under 5% left.')
+  })
+
+  it('does nothing with sticky strategy, before initialization, after stop, or for a suspended router', async () => {
+    const sticky = await started({ strategy: 'sticky' })
+    await sticky.controller.rebalance(provider, 'new')
+    expect(sticky.activate).not.toHaveBeenCalled()
+    const early = fixture(provider, { cold: true })
+    early.setMonitor(usageBy(early, userCase))
+    await early.controller.rebalance(provider, 'new')
+    expect(early.activate).not.toHaveBeenCalled()
+    expect(early.listAccounts).not.toHaveBeenCalled()
+    const stopped = await started()
+    stopped.controller.stop()
+    await stopped.controller.rebalance(provider, 'new')
+    expect(stopped.activate).not.toHaveBeenCalled()
+    const suspended = fixture(provider, { cold: true })
+    suspended.setActive('outside')
+    await suspended.controller.initialize(provider)
+    await suspended.controller.rebalance(provider, 'new')
+    expect(suspended.activate).not.toHaveBeenCalled()
+    expect(suspended.fetch).not.toHaveBeenCalled()
+    expect(suspended.decisions.map(item => item.event)).toEqual(['pause'])
+  })
+
+  it('leaves the paid key to reclaim and never activates the key or an unselected account', async () => {
+    const f = await started({}, { a: { session: hours(4) }, b: { session: minutes(30) } })
+    f.setActive('key')
+    await f.controller.rebalance(provider, 'new')
+    expect(f.activate).not.toHaveBeenCalled()
+    const g = await started({ settings: { allowPaidFallback: false, apiKeyAccountID: undefined, apiKeyModels: [] } })
+    await g.controller.rebalance(provider, 'new')
+    expect(g.activate.mock.calls.every(([, id]) => id === 'a' || id === 'b')).toBe(true)
+  })
+
+  it('switches exactly once when several prompts arrive together', async () => {
+    const f = await started()
+    await Promise.all(['one', 'two', 'three'].map(id => f.controller.rebalance(provider, id)))
+    await f.controller.rebalance(provider, 'four')
+    expect(f.activate.mock.calls).toEqual([[provider, 'b']])
+  })
+
+  it('cancels the switch when a conversation starts while usage is being refreshed', async () => {
+    const f = await started()
+    f.advance(interval + 1)
+    let release: () => void = () => {}
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const fetched = new Promise<void>(resolve => { f.setMonitor(async headers => { resolve(); await gate; return usageBy(f, userCase)(headers) }) })
+    const pending = f.controller.rebalance(provider, 'new')
+    await fetched
+    await converse(f, 'other')
+    release()
+    await pending
+    expect(f.activate).not.toHaveBeenCalled()
+  })
+
+  it('does not switch when the active account changes while usage is being refreshed', async () => {
+    const f = await started()
+    f.advance(interval + 1)
+    let release: () => void = () => {}
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const fetched = new Promise<void>(resolve => { f.setMonitor(async headers => { resolve(); await gate; return usageBy(f, userCase)(headers) }) })
+    const pending = f.controller.rebalance(provider, 'new')
+    await fetched
+    f.setActive('b')
+    release()
+    await pending
+    expect(f.activate).not.toHaveBeenCalled()
+  })
+
+  it('holds a prompt at most about four seconds when the usage endpoint hangs, then keeps the account on stale data', async () => {
+    const f = await started()
+    f.advance(interval + 1)
+    f.setMonitor(() => new Promise<Response>(() => {}))
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      let done = false
+      const pending = f.controller.rebalance(provider, 'new').then(() => { done = true })
+      await vi.advanceTimersByTimeAsync(3_999)
+      expect(done).toBe(false)
+      await vi.advanceTimersByTimeAsync(1)
+      await pending
+      expect(done).toBe(true)
+    } finally { vi.useRealTimers() }
+    expect(f.activate).not.toHaveBeenCalled()
+    expect(f.decisions.at(-1)?.reason).toBe('No recent usage for Synthetic b yet.')
+  })
+
+  it('treats activity saved by a previous run as warm, so a restart does not drop a live cache', async () => {
+    const state = emptyState()
+    state.activity = { [provider]: epoch - cache + minutes(3) }
+    const f = fixture(provider, { state })
+    f.setMonitor(usageBy(f, userCase))
+    await f.controller.initialize(provider)
+    await f.controller.rebalance(provider, 'new')
+    expect(f.activate).not.toHaveBeenCalled()
+    f.advance(minutes(3))
+    await f.controller.rebalance(provider, 'new')
+    expect(f.activate).toHaveBeenCalledWith(provider, 'b')
+  })
+
+  it("respects another OpenCode process's recent activity from the shared state file", async () => {
+    let shared: number | undefined = epoch - cache + minutes(4)
+    const f = await started({ readActivity: async () => (shared === undefined ? undefined : { [provider]: shared }) })
+    await f.controller.rebalance(provider, 'new')
+    expect(f.activate).not.toHaveBeenCalled()
+    // A future timestamp from a skewed clock is ignored rather than blocking routing forever.
+    shared = epoch + hours(24)
+    f.advance(minutes(5))
+    expect(f.activate).not.toHaveBeenCalled()
+    await f.controller.rebalance(provider, 'new')
+    expect(f.activate).toHaveBeenCalledWith(provider, 'b')
+  })
+
+  it('re-reads shared activity right before switching, in case another process started a conversation meanwhile', async () => {
+    let reads = 0
+    const f = await started({ readActivity: async () => (++reads >= 2 ? { [provider]: epoch } : undefined) })
+    await f.controller.rebalance(provider, 'new')
+    expect(reads).toBeGreaterThanOrEqual(2)
+    expect(f.activate).not.toHaveBeenCalled()
+  })
+
+  it('persists activity still inside the save throttle when draining on shutdown', async () => {
+    const f = await started()
+    await converse(f)
+    f.advance(20_000)
+    await converse(f)
+    expect(f.persist.mock.calls.at(-1)?.[0].activity?.[provider]).toBe(epoch)
+    f.controller.stop()
+    await f.controller.drain()
+    expect(f.persist.mock.calls.at(-1)?.[0].activity?.[provider]).toBe(epoch + 20_000)
+    const calls = f.persist.mock.calls.length
+    await f.controller.drain()
+    expect(f.persist.mock.calls.length).toBe(calls)
+  })
+
+  it('ignores an unreadable shared state file', async () => {
+    const f = await started({ readActivity: async () => { throw new Error('unreadable') } })
+    await f.controller.rebalance(provider, 'new')
+    expect(f.activate).toHaveBeenCalledWith(provider, 'b')
+  })
+
+  it('lets OpenCode refresh an idle expired token at most once per poll interval, then routes on fresh usage', async () => {
+    const f = fixture(provider, { cold: true })
+    const stale = f.credentials.find(value => value.id === 'b')!
+    stale.expiresAt = epoch - 1
+    f.readCredentials.mockImplementation(async (target, options) => structuredClone(f.credentials.filter(value => value.provider === target).map(value => value.id === 'b' && options?.refresh ? { ...value, expiresAt: epoch + hours(8) } : value)))
+    f.setMonitor(usageBy(f, userCase))
+    await f.controller.initialize(provider)
+    expect(f.state.usage[`${provider}:b`]?.status).toBe('expired')
+    f.advance(minutes(1))
+    await f.controller.rebalance(provider, 'new')
+    expect(f.readCredentials.mock.calls.filter(([, options]) => options?.refresh)).toHaveLength(1)
+    expect(f.state.usage[`${provider}:b`]?.status).toBe('ok')
+    expect(f.activate).toHaveBeenCalledWith(provider, 'b')
+    const g = fixture(provider, { cold: true })
+    g.credentials.find(value => value.id === 'b')!.expiresAt = epoch - 1
+    g.setMonitor(usageBy(g, userCase))
+    await g.controller.initialize(provider)
+    for (let index = 0; index < 4; index++) {
+      g.advance(minutes(2))
+      await g.controller.rebalance(provider, `new-${index}`)
+    }
+    // OpenCode could not refresh it, so the router asked once and never moved to an account it cannot see.
+    expect(g.readCredentials.mock.calls.filter(([, options]) => options?.refresh)).toHaveLength(1)
+    expect(g.activate).not.toHaveBeenCalled()
+  })
+
+  it('saves conversation activity at most once a minute', async () => {
+    const f = await started()
+    const before = f.persist.mock.calls.length
+    // Three minutes of steady traffic, one request a second.
+    for (let index = 0; index < 180; index++) {
+      await converse(f, 'busy')
+      f.advance(1_000)
+    }
+    const saves = f.persist.mock.calls.slice(before).filter(([state]) => state.activity?.[provider] !== undefined)
+    expect(saves.length).toBeGreaterThanOrEqual(3)
+    expect(saves.length).toBeLessThanOrEqual(4)
+    expect(saves.at(-1)?.[0].activity?.[provider]).toBe(epoch + 120_000)
+    expect(f.state.activity?.[provider]).toBe(epoch + 179_000)
+  })
+
+  it('logs every decision without credentials', async () => {
+    const f = await started()
+    await f.controller.rebalance(provider, 'new')
+    await converse(f, 'new', 'primary', 'b')
+    const serialized = JSON.stringify(f.decisions)
+    for (const value of f.credentials) {
+      if (value.access) expect(serialized).not.toContain(value.access)
+      if (value.key) expect(serialized).not.toContain(value.key)
+    }
+    expect(f.decisions.map(item => item.event)).toEqual(['cache', 'usage', 'usage', 'start', 'switch', 'use'])
+    expect(f.decisions.find(item => item.event === 'use')).toMatchObject({ to: 'Synthetic b', reason: 'Session new (model).' })
+    expect(f.decisions.filter(item => item.event === 'usage').map(item => [item.from, item.reason])).toEqual([
+      ['Synthetic a', '5-hour 20% (resets in 3h 42m) · Weekly 30% (resets in 4d 20h)'],
+      ['Synthetic b', '5-hour 20% (resets in 1h 42m) · Weekly 30% (resets in 3d 23h)'],
+    ])
+    expect(f.decisions.every(item => item.provider === provider && item.at >= epoch)).toBe(true)
+  })
+
+  it('uses the cache lifetime OpenCode is configured with (cache.ttl), never shorter than the provider default', async () => {
+    const f = await started({ cacheTTL: async () => hours(1) })
+    expect(f.controller.cacheWindow(provider)).toEqual({ ms: hours(1), source: 'OpenCode cache.ttl setting (1h 0m)' })
+    expect(f.decisions[0]).toMatchObject({ event: 'cache', reason: 'Prompt cache counts as warm for 1h 0m after a conversation request (OpenCode cache.ttl setting (1h 0m)). Smart switches wait that long.' })
+    await converse(f)
+    f.advance(minutes(59))
+    await f.controller.rebalance(provider, 'new')
+    expect(f.activate).not.toHaveBeenCalled()
+    f.advance(minutes(1))
+    await f.controller.rebalance(provider, 'new')
+    expect(f.activate).toHaveBeenCalledWith(provider, 'b')
+    const short = await started({ cacheTTL: async () => minutes(1) })
+    expect(short.controller.cacheWindow(provider).ms).toBe(cache)
+    const failing = await started({ cacheTTL: async () => { throw new Error('settings unavailable') } })
+    expect(failing.controller.cacheWindow(provider)).toEqual({ ms: cache, source: `${provider === 'anthropic' ? 'Anthropic' : 'OpenAI'} default; OpenCode sends no cache.ttl` })
+    const override = await started({ cacheWindowMs: minutes(20), cacheTTL: async () => hours(1) })
+    expect(override.controller.cacheWindow(provider)).toEqual({ ms: minutes(20), source: 'cacheWindowMs in the router config' })
+  })
+
+  it('logs how each failed request was classified, and why a failover could not happen', async () => {
+    const f = fixture(provider, { settings: { allowPaidFallback: false, apiKeyAccountID: undefined, apiKeyModels: [] } })
+    await f.controller.initialize(provider)
+    const throttle = provider === 'anthropic' ? JSON.stringify({ error: { type: 'rate_limit_error', message: 'Too many requests per minute' } }) : JSON.stringify({ error: { type: 'rate_limit_exceeded' } })
+    const { input } = await f.reject('a', { body: throttle, headers: {} })
+    input.error.type = 'provider.rate-limit'
+    expect(await f.controller.onRetry(input)).toBe(false)
+    expect(f.decisions.at(-1)).toMatchObject({ event: 'ignored', level: 'info', from: 'Synthetic a' })
+    expect(f.decisions.at(-1)?.reason).toMatch(/temporary rate limit or overload \(HTTP 429.*OpenCode retries on the same account/)
+    f.credentials.find(value => value.id === 'b')!.needsAuth = true
+    f.accounts.find(value => value.id === 'b')!.needsAuth = true
+    f.advance(60_000)
+    const quota = await f.reject('a')
+    expect(f.decisions.at(-1)).toMatchObject({ event: 'quota', level: 'warn', from: 'Synthetic a' })
+    expect(f.decisions.at(-1)?.reason).toContain('allowance is used up (HTTP 429')
+    expect(await f.controller.onRetry(quota.input)).toBe(false)
+    expect(f.decisions.at(-1)).toMatchObject({ event: 'no-switch', level: 'warn', from: 'Synthetic a' })
+    expect(f.decisions.at(-1)?.reason).toBe("Out of allowance and no safe account to move to (Synthetic b: needs sign-in or its token is unavailable; paid fallback is off). The request ends with the provider's error.")
+  })
+
+  it('logs a warning when a conversation request cannot be matched to a selected account', async () => {
+    const f = await started()
+    const unknown = f.request('outside')
+    await f.controller.onRequest(scopeFor(f, 'mystery'), unknown)
+    expect(f.decisions.at(-1)).toMatchObject({ event: 'use', level: 'warn' })
+    expect(f.decisions.at(-1)?.reason).toContain('could not match to a selected account')
+    await f.controller.onRequest(scopeFor(f, 'mystery'), f.request('outside'))
+    expect(f.decisions.filter(item => item.event === 'use')).toHaveLength(1)
+  })
+
+  it('logs failed usage checks as warnings with the next retry time', async () => {
+    const f = fixture(provider, { cold: true })
+    f.setMonitor(() => new Response('busy', { status: 429, headers: { 'retry-after': '1200' } }))
+    await f.controller.initialize(provider)
+    const usage = f.decisions.filter(item => item.event === 'usage')
+    expect(usage.map(item => item.level)).toEqual(['warn', 'warn'])
+    expect(usage[0]?.reason).toMatch(/^usage check was rate-limited by the provider; next try in \d+m$/)
+  })
+
+  it('a throwing logger never breaks routing', async () => {
+    const f = fixture(provider, { cold: true })
+    f.setMonitor(usageBy(f, userCase))
+    const controller = new RouterController({ config: f.config, state: f.state, host: { activate: f.activate, readCredentials: f.readCredentials, listAccounts: f.listAccounts }, fetch: f.fetch, now: f.now, log: () => { throw new Error('disk full') } })
+    controllers.push(controller)
+    await controller.initialize(provider)
+    await controller.rebalance(provider, 'new')
+    expect(f.activate).toHaveBeenCalledWith(provider, 'b')
+  })
+
+  it('failover after a smart switch still works and picks by soonest-expiring allowance', async () => {
+    const f = fixture(provider, { cold: true, settings: { accountIDs: ['a', 'b', 'c'], allowPaidFallback: false, apiKeyAccountID: undefined, apiKeyModels: [] } })
+    f.setMonitor(usageBy(f, { a: { session: hours(4) }, b: { session: hours(3) }, c: { session: hours(1) } }))
+    await f.controller.initialize(provider)
+    await converse(f)
+    const { input } = await f.reject('a')
+    expect(await f.controller.onRetry(input)).toBe(true)
+    expect(f.activate.mock.calls.at(-1)).toEqual([provider, 'c'])
+    expect(f.decisions.at(-1)).toMatchObject({ event: 'failover', from: 'Synthetic a', to: 'Synthetic c' })
   })
 })

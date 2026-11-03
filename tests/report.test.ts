@@ -154,6 +154,30 @@ describe('status report', () => {
   })
 })
 
+describe('smart routing in the status report', () => {
+  it('explains the mode in the footer and stays within 80 columns', () => {
+    const smartText = formatReport(buildReport(config, state(), { now, accounts, live: true }))
+    expect(smartText).toContain('Smart routing: once the prompt cache has expired (5m with')
+    expect(smartText).not.toContain('The router switches accounts only when one runs out.')
+    const stickyText = formatReport(buildReport({ ...config, strategy: 'sticky' }, state(), { now, accounts, live: true }))
+    expect(stickyText).toContain('The router switches accounts only when one runs out.')
+    expect(stickyText).not.toContain('Smart routing')
+    for (const text of [smartText, stickyText]) expect(text.split('\n').every(line => line.length <= 80)).toBe(true)
+  })
+
+  it('shows where the next quiet prompt would move, never onto an account in cooldown', () => {
+    const value = state()
+    // A's 5-hour window is running and expires soon, but A is in cooldown: no smart move.
+    value.usage['anthropic:a']!.windows[0] = { id: 'five_hour', label: '5-hour', usedPercent: 10, resetsAt: now + 3_600_000, durationSeconds: 18_000 }
+    expect(buildReport(config, value, { now, accounts, live: true }).providers[0]!.better).toBeUndefined()
+    delete value.cooldowns['anthropic:a']
+    const report = buildReport(config, value, { now, accounts, live: true })
+    expect(report.providers[0]!.better).toMatchObject({ label: 'Personal' })
+    expect(formatReport(report)).toContain('→ Next quiet prompt moves to: Personal')
+    expect(buildReport({ ...config, strategy: 'sticky' }, value, { now, accounts, live: true }).providers[0]!.better).toBeUndefined()
+  })
+})
+
 describe('setup text helpers', () => {
   it('wraps long lines within the width and keeps bullet and label indentation', () => {
     const text = wrap('• Usage is checked with Anthropic and OpenAI about every ten minutes while you are active in OpenCode.\n  Accounts:       Personal account, Work account, Another account, Yet another account\nshort', 40)
