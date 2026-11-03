@@ -1,9 +1,17 @@
 name: CI
 
+# Runs on instabox machines (https://instabox.sh/docs/ci.md): every job gets a fresh
+# Ubuntu 24.04 VM, deleted when the job ends. No secrets are used or needed.
 on:
+  pull_request:
+    branches: [main]
   push:
     branches: [main]
-  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -11,16 +19,19 @@ permissions:
 jobs:
   check:
     name: check (node ${{ matrix.node }})
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         # Node 22: package + unit/integration tests. Node 24: also the real OpenCode engine E2E suite.
         node: [22, 24]
     steps:
-      - uses: actions/checkout@v5
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
           cache: pnpm
